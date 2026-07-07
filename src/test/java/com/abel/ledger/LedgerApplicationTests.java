@@ -1,5 +1,8 @@
 package com.abel.ledger;
 
+import com.abel.ledger.repository.AccountRepository;
+import com.abel.ledger.repository.JournalEntryRepository;
+import com.abel.ledger.repository.LedgerEntryRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -43,8 +46,28 @@ class LedgerApplicationTests {
     @Autowired
     private TestRestTemplate restTemplate;
 
+    @Autowired
+    private AccountRepository accountRepository;
+
+    @Autowired
+    private JournalEntryRepository journalEntryRepository;
+
+    @Autowired
+    private LedgerEntryRepository ledgerEntryRepository;
+
     @Test
     void contextLoads() {
+    }
+
+    @Test
+    void repositoryBeansLoadAndFlywayMigrationsHaveRun() {
+        assertThat(accountRepository).isNotNull();
+        assertThat(journalEntryRepository).isNotNull();
+        assertThat(ledgerEntryRepository).isNotNull();
+
+        assertThat(accountRepository.findAll()).isEmpty();
+        assertThat(journalEntryRepository.findAll()).isEmpty();
+        assertThat(ledgerEntryRepository.findAll()).isEmpty();
     }
 
     @Test
