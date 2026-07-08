@@ -1,21 +1,22 @@
 # Architecture
 
 This document is updated at the end of every phase. It reflects the state
-of the system as of **Phase 2: Ledger Posting Engine**.
+of the system as of **Phase 3: REST API Layer**.
 
 ## System overview
 
 `double-entry-ledger` is a production-grade, immutable double-entry
 bookkeeping service. Clients post complete, balanced accounting
-transactions (`JournalEntry` + its `LedgerEntry` lines); the service
-validates and persists them atomically. Account balances are never
-stored — they are always derived on demand by aggregating `ledger_entries`
-in PostgreSQL. Posted records are immutable and append-only: corrections
-happen by posting a new, separate correcting transaction, never by editing
-or deleting history.
+transactions (`JournalEntry` + its `LedgerEntry` lines) over a versioned
+REST API; the service validates and persists them atomically. Account
+balances are never stored — they are always derived on demand by
+aggregating `ledger_entries` in PostgreSQL. Posted records are immutable
+and append-only: corrections happen by posting a new, separate correcting
+transaction, never by editing or deleting history.
 
-As of Phase 2, the service has a complete service-layer posting and
-balance-derivation engine with no HTTP surface yet (see Roadmap).
+As of Phase 3, the service exposes its posting and query engine over a
+REST API (`/api/v1`) documented with OpenAPI/Swagger, with no Kafka
+publishing or concurrency-specific locking yet (see Roadmap).
 
 ## Package structure
 
@@ -23,24 +24,42 @@ balance-derivation engine with no HTTP surface yet (see Roadmap).
 src/main/java/com/abel/ledger/
   LedgerApplication.java        application entrypoint
   controller/
-    StatusController.java       liveness endpoint ("/")
+    StatusController.java       liveness endpoint ("/"), unversioned
+  config/
+    OpenApiConfig.java          OpenAPI title/description bean
   domain/
     account/                    Account entity, AccountType enum
     journal/                    JournalEntry entity
     ledger/                     LedgerEntry entity, EntryType enum
     idempotency/                IdempotencyKey entity
-  dto/                          request/response DTOs for the service layer
-                                 (PostingRequest, LedgerEntryRequest,
-                                 PostingResult, LedgerEntryResult,
-                                 AccountBalance) — JPA entities are never
-                                 exposed across a service boundary
+  dto/                          SERVICE-layer DTOs (PostingRequest,
+                                 LedgerEntryRequest, PostingResult,
+                                 LedgerEntryResult, AccountBalance) —
+                                 JPA entities are never exposed across a
+                                 service boundary, and these are never
+                                 reused directly as API request/response
+                                 models (see api/dto below)
   exception/                    LedgerException hierarchy: domain-specific
-                                 failures raised by PostingService/BalanceService
+                                 failures raised by the service layer
+                                 (PostingService/BalanceService/
+                                 LedgerQueryService)
   repository/                   Spring Data JPA repositories, one per
                                  aggregate (flat, not nested under domain/)
   service/
     PostingService.java         validates and atomically posts transactions
     BalanceService.java         derives account balances via live SQL aggregation
+    LedgerQueryService.java     read-only journal entry / ledger entry lookups
+  api/                          the REST layer — see "API layer structure" below
+    controller/
+      JournalEntryController.java
+      AccountController.java
+    dto/
+      request/                  API-layer request DTOs (Jakarta Validation)
+      response/                 API-layer response DTOs, incl. PagedResponse<T>
+    mapper/
+      LedgerApiMapper.java      API DTO <-> service DTO translation
+    exception/
+      GlobalExceptionHandler.java   @RestControllerAdvice, all exception->HTTP mapping
 src/main/resources/
   application.yml               base configuration
   application-dev.yml           local development overrides
@@ -52,10 +71,88 @@ src/test/java/com/abel/ledger/
     BalanceServiceTest.java              unit tests, mocked repositories
     PostingServiceIntegrationTest.java   integration tests, real Postgres
     BalanceServiceIntegrationTest.java   integration tests, real Postgres
+  api/controller/
+    JournalEntryControllerIntegrationTest.java   MockMvc, real HTTP request/response
+    AccountControllerIntegrationTest.java        MockMvc, real HTTP request/response
 docs/
   architecture.md               this file
   posting-flow.md               ordered walkthrough of the posting flow
+  api-examples.md               curl/HTTPie + JSON examples per endpoint
 ```
+
+## API layer structure
+
+Every request flows through the same four-stage pipeline:
+
+```
+Controller → API DTO → Mapper → Service DTO → Service
+```
+
+- **Controllers** (`api/controller`) do no business logic. They deserialize
+  the API request DTO (validated by Jakarta Validation via `@Valid`),
+  hand it to `LedgerApiMapper` to become a service-layer DTO, call
+  `PostingService`/`BalanceService`/`LedgerQueryService`, and map the
+  result back to an API response DTO. All exceptions propagate up to
+  `GlobalExceptionHandler` — no controller catches anything.
+- **API DTOs** (`api/dto/request`, `api/dto/response`) are a completely
+  separate set of types from the Phase 2 service DTOs in `dto/`, even
+  where their shape is currently identical (e.g. a ledger entry line).
+  This means the public API contract can evolve — add a field, rename
+  something, version a new representation — without touching
+  `PostingService`/`BalanceService`, and vice versa. Request DTOs carry
+  Jakarta Validation annotations (`@NotBlank`, `@Positive`, `@Size`,
+  `@Digits`, `@Valid` for nested lists); response DTOs never expose a JPA
+  entity.
+- **`LedgerApiMapper`** is the single translation point between the two
+  DTO families, in both directions (request → service DTO, service
+  result → response DTO).
+- **`PostingService`/`BalanceService`** are unchanged from Phase 2 — the
+  REST layer was built entirely on top of them, per this phase's
+  constraint. Read-only queries that Phase 2 didn't need
+  (`GET /journal-entries/{id}`, paginated
+  `GET /accounts/{id}/ledger`) live in a new `LedgerQueryService`
+  rather than being bolted onto either existing service.
+- **Pagination**: `AccountController#getLedger` accepts a Spring Data
+  `Pageable` (page/size/sort query parameters, default
+  `sort=createdAt,desc`) and calls `LedgerQueryService`, which returns a
+  `Page<LedgerEntryResult>`. The controller never returns that `Page<T>`
+  directly — it's wrapped in `PagedResponse<T>`
+  (`content`, `page`, `size`, `totalElements`, `totalPages`, `hasNext`)
+  so the API contract doesn't leak Spring Data's internal pagination
+  model.
+
+## HTTP status code reasoning: 400 vs. 422
+
+The API distinguishes two different ways a request can be rejected:
+
+- **400 Bad Request** — the request is malformed: a required field is
+  missing/blank, a type doesn't match, a value fails a structural
+  constraint (`@NotBlank`, `@Positive`, `@Size`, `@Digits`). These are
+  caught either by Jakarta Validation before the controller body even
+  runs (`MethodArgumentNotValidException`) or, as a defense-in-depth
+  fallback, by `PostingService`'s own structural checks
+  (`InvalidPostingRequestException`). The client sent something the API
+  can't parse into a valid domain request at all.
+- **422 Unprocessable Entity** — the request is syntactically valid (it
+  passes every Jakarta Validation constraint and parses into a coherent
+  `PostingRequest`) but violates a business rule once the service
+  evaluates it: debits and credits don't balance
+  (`UnbalancedJournalEntryException`) or an entry's currency doesn't
+  match its account's currency, or entries mix currencies
+  (`CurrencyMismatchException`). The request is well-formed; the
+  transaction it describes just isn't a valid accounting entry.
+
+`GlobalExceptionHandler` encodes this split directly: `InvalidPostingRequestException`
+and `MethodArgumentNotValidException` map to 400; `UnbalancedJournalEntryException`
+and `CurrencyMismatchException` map to 422.
+
+One deliberate non-obvious choice: a replay of an already-processed
+`idempotencyKey` with an *identical* payload is treated as another
+successful creation — `POST /api/v1/journal-entries` returns `201 Created`
+with the same `Location` and body both times, since `PostingService.post()`
+gives the controller no signal distinguishing "just created" from
+"returned an existing result," and the resource genuinely does exist at
+that location either way.
 
 ## Database schema
 
@@ -84,6 +181,9 @@ Four tables, managed by Flyway migrations in
 Entry currency is validated against its account's currency in the service
 layer (`PostingService`), not the schema — PostgreSQL has no clean way to
 express a cross-table CHECK constraint for this.
+
+No schema changes in Phase 3 — the REST layer is read/write access to the
+same three tables above, via the same repositories.
 
 ## Key design decisions
 
@@ -132,14 +232,75 @@ express a cross-table CHECK constraint for this.
   (debit-normal: `ASSET`, `EXPENSE`; credit-normal: `LIABILITY`, `EQUITY`,
   `REVENUE`) is applied in `BalanceService`, not the query, keeping the
   repository purely mechanical.
+- **Separate API and service DTOs, joined by one mapper** (Phase 3). See
+  "API layer structure" above. The alternative — reusing `dto/`'s
+  `PostingRequest`/`PostingResult` etc. directly as controller
+  request/response models — was rejected because it would couple the
+  public HTTP contract to internal service-layer shape, making either one
+  harder to change independently.
+- **400 vs. 422** (Phase 3). See "HTTP status code reasoning" above.
+- **New `LedgerQueryService` instead of extending `PostingService`/
+  `BalanceService`** (Phase 3). Phase 3's instructions were explicit:
+  don't modify those two classes. `GET /journal-entries/{id}` and
+  paginated `GET /accounts/{id}/ledger` are new read paths with no
+  Phase 2 equivalent, so they got a new service rather than being
+  force-fit into an existing one.
+- **Known tradeoff: extra re-read after posting, to work around
+  `@CreationTimestamp` flush timing** (Phase 3). `JournalEntry` and
+  `LedgerEntry` both use Hibernate's `@CreationTimestamp`, which only
+  populates `createdAt` when the row is actually flushed/inserted — and
+  because `PostingService.post()` never explicitly flushes, that happens
+  at transaction commit, *after* `post()` has already built and returned
+  its `PostingResult`. A live smoke test against the running app showed
+  this concretely: `POST /api/v1/journal-entries` came back with
+  `"createdAt": null` on the journal entry and both lines, while an
+  immediate `GET` on the same id returned real timestamps for the exact
+  same row. `JournalEntryController.postJournalEntry` works around this
+  by re-reading the journal entry through `LedgerQueryService` right
+  after `postingService.post()` returns — by then the transaction has
+  committed, so the re-read is guaranteed to see populated timestamps.
+  This is a controller-layer workaround, not a root-cause fix: it costs
+  one extra indexed read per post. The root-cause fix — setting
+  `createdAt` explicitly in Java before persisting (the same treatment
+  already given to the entity's UUID, which is client-generated rather
+  than DB-generated) so the value is known immediately without a flush —
+  would avoid that extra query entirely, but requires editing
+  `PostingService`/the entities, which is out of scope for this phase.
+  Worth revisiting when `PostingService` is next touched.
+- **`PagedResponse<T>` instead of returning `Page<T>`** (Phase 3). Spring
+  Data's `Page<T>` JSON representation carries Spring-internal fields
+  (`pageable`, `sort` metadata shape, etc.) that aren't a contract anyone
+  should depend on. `PagedResponse<T>` is a small, stable, hand-written
+  shape (`content`, `page`, `size`, `totalElements`, `totalPages`,
+  `hasNext`).
+- **MockMvc for REST integration tests, not a real HTTP client** (Phase 3).
+  `@SpringBootTest(webEnvironment = MOCK)` + `@AutoConfigureMockMvc` runs
+  requests through the actual `DispatcherServlet`, filters, Jakarta
+  Validation, and `GlobalExceptionHandler` — the same code path a real
+  HTTP request takes — without binding a socket or needing a separate
+  HTTP client dependency. This is the standard Spring Boot approach for
+  controller-level tests and is faster and more deterministic than
+  driving the app over a real port.
+- **Kafka health indicator explicitly disabled** (Phase 3).
+  `spring-kafka` has been a dependency since Phase 0 and Spring Boot
+  auto-configures a `KafkaAdmin` bean whenever it's on the classpath,
+  which in turn auto-registers a Kafka health indicator — even though no
+  Kafka publishing exists yet. `management.health.kafka.enabled: false`
+  suppresses it until Kafka is actually implemented, so
+  `/actuator/health` doesn't report on a feature that doesn't exist.
+  Database health is left enabled (`show-details: always`) since a real
+  `DataSource` bean has existed since Phase 1.
 
 ## Roadmap
 
 - **Phase 0** (done): runnable scaffold, health endpoint, infra wiring.
 - **Phase 1** (done): accounts, immutable ledger entries, base schema.
-- **Phase 2** (this phase): balanced/idempotent posting engine, live
-  balance derivation, service-layer validation.
-- **Later phases**: REST API surface for posting and querying, Kafka event
-  publishing on successful posts, concurrency handling (optimistic or
-  pessimistic locking, isolation-level tuning) for concurrent postings
-  against the same account.
+- **Phase 2** (done): balanced/idempotent posting engine, live balance
+  derivation, service-layer validation.
+- **Phase 3** (this phase): versioned REST API (`/api/v1`) over the
+  existing posting/balance/query engine, centralized exception-to-HTTP
+  mapping, OpenAPI/Swagger documentation, paginated ledger history.
+- **Later phases**: Kafka event publishing on successful posts,
+  concurrency handling (optimistic or pessimistic locking,
+  isolation-level tuning) for concurrent postings against the same
+  account.

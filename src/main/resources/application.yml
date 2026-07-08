@@ -44,7 +44,19 @@ management:
         include: health,info
   endpoint:
     health:
-      show-details: when-authorized
+      show-details: always
+  health:
+    # Kafka publishing isn't implemented yet (deferred to a later phase);
+    # suppress the indicator that spring-kafka's auto-configured KafkaAdmin
+    # bean would otherwise register automatically.
+    kafka:
+      enabled: false
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
 
 logging:
   level:
