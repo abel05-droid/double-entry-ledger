@@ -1,8 +1,11 @@
 package com.abel.ledger.kafka;
 
 import com.abel.ledger.event.JournalEntryPostedEvent;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.time.Instant;
 import java.util.UUID;
+import net.logstash.logback.argument.StructuredArguments;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -50,9 +53,12 @@ public class LedgerEventPublisher {
     private static final Logger log = LoggerFactory.getLogger(LedgerEventPublisher.class);
 
     private final KafkaTemplate<String, JournalEntryPostedMessage> kafkaTemplate;
+    private final MeterRegistry meterRegistry;
 
-    public LedgerEventPublisher(KafkaTemplate<String, JournalEntryPostedMessage> ledgerEventKafkaTemplate) {
+    public LedgerEventPublisher(
+            KafkaTemplate<String, JournalEntryPostedMessage> ledgerEventKafkaTemplate, MeterRegistry meterRegistry) {
         this.kafkaTemplate = ledgerEventKafkaTemplate;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -79,19 +85,25 @@ public class LedgerEventPublisher {
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onJournalEntryPosted(JournalEntryPostedEvent event) {
         String key = event.journalEntryId().toString();
+        UUID eventId = UUID.randomUUID();
         JournalEntryPostedMessage message = new JournalEntryPostedMessage(
-                UUID.randomUUID(),
+                eventId,
                 JournalEntryPostedMessage.CURRENT_EVENT_VERSION,
                 event.journalEntryId(),
                 event.referenceId(),
                 event.postedAt(),
                 event.affectedAccountIds().stream().sorted().toList());
 
+        Timer.Sample sample = Timer.start(meterRegistry);
         try {
             kafkaTemplate.send(LedgerKafkaTopics.JOURNAL_ENTRY_POSTED, key, message)
                     .whenComplete((result, ex) -> {
                         if (ex != null) {
-                            logPublishFailure(event.journalEntryId(), ex);
+                            recordFailure(sample);
+                            logPublishFailure(event.journalEntryId(), eventId, ex);
+                        } else {
+                            recordSuccess(sample);
+                            logPublishSuccess(event.journalEntryId(), eventId);
                         }
                     });
         } catch (Exception ex) {
@@ -99,13 +111,46 @@ public class LedgerEventPublisher {
             // serialization failure) rather than only failing the future it
             // returns; caught here for the same reason the future's
             // exceptional completion is handled above.
-            logPublishFailure(event.journalEntryId(), ex);
+            recordFailure(sample);
+            logPublishFailure(event.journalEntryId(), eventId, ex);
         }
     }
 
-    private void logPublishFailure(UUID journalEntryId, Throwable ex) {
+    private void recordSuccess(Timer.Sample sample) {
+        sample.stop(meterRegistry.timer("ledger.kafka.publish.duration", "outcome", "success"));
+        meterRegistry.counter("ledger.kafka.publish.requests", "outcome", "success").increment();
+    }
+
+    private void recordFailure(Timer.Sample sample) {
+        sample.stop(meterRegistry.timer("ledger.kafka.publish.duration", "outcome", "failure"));
+        meterRegistry.counter("ledger.kafka.publish.requests", "outcome", "failure").increment();
+    }
+
+    private void logPublishSuccess(UUID journalEntryId, UUID eventId) {
+        log.debug(
+                "Published ledger event to Kafka {} {} {}",
+                StructuredArguments.kv("journalEntryId", journalEntryId),
+                StructuredArguments.kv("eventId", eventId),
+                StructuredArguments.kv("topic", LedgerKafkaTopics.JOURNAL_ENTRY_POSTED));
+    }
+
+    /**
+     * {@code correlationId} is deliberately not added here: this callback
+     * may run on the Kafka producer's own I/O thread rather than the
+     * original request thread once the send is genuinely asynchronous, and
+     * SLF4J's MDC is thread-local — a correlation id set on the request
+     * thread would not be visible here. See docs/architecture.md,
+     * "Observability", for this known limitation.
+     */
+    private void logPublishFailure(UUID journalEntryId, UUID eventId, Throwable ex) {
         log.error(
-                "Failed to publish ledger event to Kafka: journalEntryId={}, topic={}, timestamp={}, exception={}",
-                journalEntryId, LedgerKafkaTopics.JOURNAL_ENTRY_POSTED, Instant.now(), ex.getMessage(), ex);
+                "Failed to publish ledger event to Kafka {} {} {} {} {} {}",
+                StructuredArguments.kv("journalEntryId", journalEntryId),
+                StructuredArguments.kv("eventId", eventId),
+                StructuredArguments.kv("topic", LedgerKafkaTopics.JOURNAL_ENTRY_POSTED),
+                StructuredArguments.kv("timestamp", Instant.now()),
+                StructuredArguments.kv("exceptionClass", ex.getClass().getName()),
+                StructuredArguments.kv("exceptionMessage", ex.getMessage()),
+                ex);
     }
 }

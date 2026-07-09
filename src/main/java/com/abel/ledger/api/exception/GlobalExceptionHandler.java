@@ -11,6 +11,9 @@ import com.abel.ledger.exception.UnbalancedJournalEntryException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.time.Instant;
 import java.util.stream.Collectors;
+import net.logstash.logback.argument.StructuredArguments;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -33,6 +36,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     @ExceptionHandler(IdempotencyKeyConflictException.class)
     public ResponseEntity<ErrorResponse> handleIdempotencyConflict(
@@ -72,6 +77,13 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex, HttpServletRequest request) {
+        log.error(
+                "Unhandled exception processing {} {} {} {}",
+                StructuredArguments.kv("path", request.getRequestURI()),
+                StructuredArguments.kv("method", request.getMethod()),
+                StructuredArguments.kv("exceptionClass", ex.getClass().getName()),
+                StructuredArguments.kv("exceptionMessage", ex.getMessage()),
+                ex);
         return respond(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred", request);
     }
 

@@ -9,6 +9,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.abel.ledger.event.JournalEntryPostedEvent;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Instant;
 import java.util.Set;
 import java.util.UUID;
@@ -29,11 +31,13 @@ class LedgerEventPublisherTest {
     @Mock
     private KafkaTemplate<String, JournalEntryPostedMessage> kafkaTemplate;
 
+    private MeterRegistry meterRegistry;
     private LedgerEventPublisher publisher;
 
     @BeforeEach
     void setUp() {
-        publisher = new LedgerEventPublisher(kafkaTemplate);
+        meterRegistry = new SimpleMeterRegistry();
+        publisher = new LedgerEventPublisher(kafkaTemplate, meterRegistry);
     }
 
     @Test
@@ -62,6 +66,11 @@ class LedgerEventPublisherTest {
         assertThat(message.referenceId()).isEqualTo("REF-1");
         assertThat(message.postedAt()).isEqualTo(postedAt);
         assertThat(message.affectedAccountIds()).containsExactlyInAnyOrder(accountId1, accountId2);
+
+        assertThat(meterRegistry.get("ledger.kafka.publish.requests").tags("outcome", "success").counter().count())
+                .isEqualTo(1.0);
+        assertThat(meterRegistry.get("ledger.kafka.publish.duration").tags("outcome", "success").timer().count())
+                .isEqualTo(1L);
     }
 
     @Test
@@ -72,6 +81,9 @@ class LedgerEventPublisherTest {
         when(kafkaTemplate.send(anyString(), anyString(), any())).thenThrow(new KafkaException("boom"));
 
         assertThatCode(() -> publisher.onJournalEntryPosted(event)).doesNotThrowAnyException();
+
+        assertThat(meterRegistry.get("ledger.kafka.publish.requests").tags("outcome", "failure").counter().count())
+                .isEqualTo(1.0);
     }
 
     @Test
@@ -84,5 +96,8 @@ class LedgerEventPublisherTest {
         when(kafkaTemplate.send(anyString(), anyString(), any())).thenReturn(failedFuture);
 
         assertThatCode(() -> publisher.onJournalEntryPosted(event)).doesNotThrowAnyException();
+
+        assertThat(meterRegistry.get("ledger.kafka.publish.requests").tags("outcome", "failure").counter().count())
+                .isEqualTo(1.0);
     }
 }

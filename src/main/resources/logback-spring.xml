@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Plain-text logging is the default (every profile except json-logs):
+    readable at a terminal during local development, where a developer is
+    scanning scrolling output by eye. JSON logging is opt-in via the
+    "json-logs" Spring profile: that's the shape a log aggregator (ELK,
+    Loki, CloudWatch Logs Insights, Datadog, ...) expects, and is what a
+    real deployment should run with, but it's needless noise to read by
+    eye at a terminal. See docs/architecture.md, "Observability", for the
+    full rationale.
+
+    Both modes are driven by the exact same log statements — see
+    net.logstash.logback.argument.StructuredArguments usage throughout
+    com.abel.ledger.observability and com.abel.ledger.kafka.LedgerEventPublisher
+    — a StructuredArguments.kv("key", value) argument renders as "key=value"
+    in the plain-text pattern below and as an independent top-level JSON
+    field under json-logs, from one call site.
+-->
+<configuration>
+
+    <property name="PLAIN_LOG_PATTERN"
+              value="%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%thread] %logger{36} [correlationId=%X{correlationId:-none}] - %msg%n"/>
+
+    <springProfile name="!json-logs">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>${PLAIN_LOG_PATTERN}</pattern>
+            </encoder>
+        </appender>
+    </springProfile>
+
+    <springProfile name="json-logs">
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <!--
+                    All SLF4J MDC entries (including correlationId, set by
+                    CorrelationIdFilter for the lifetime of a request) are
+                    included as top-level JSON fields automatically; no
+                    explicit <includeMdcKeyName> allowlist is needed since
+                    the only MDC key this app ever sets is correlationId.
+                -->
+                <customFields>{"service":"double-entry-ledger"}</customFields>
+            </encoder>
+        </appender>
+    </springProfile>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>

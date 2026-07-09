@@ -47,16 +47,24 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       show-details: always
   health:
-    # Kafka publishing isn't implemented yet (deferred to a later phase);
-    # suppress the indicator that spring-kafka's auto-configured KafkaAdmin
-    # bean would otherwise register automatically.
+    # Boot's own auto-configured Kafka health indicator is replaced by
+    # com.abel.ledger.observability.KafkaHealthIndicator (see
+    # docs/architecture.md, "Health Checks"), which reuses the app's own
+    # KafkaAdmin bean rather than a separately-configured generic check.
+    # Originally disabled in Phase 3 when no Kafka publishing existed at
+    # all; kept disabled now for the same "avoid two indicators both
+    # claiming the 'kafka' component name" reason, not because Kafka
+    # health reporting is unwanted.
     kafka:
       enabled: false
+  metrics:
+    tags:
+      application: ${spring.application.name}
 
 springdoc:
   api-docs:

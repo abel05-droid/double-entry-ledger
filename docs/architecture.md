@@ -1,7 +1,7 @@
 # Architecture
 
 This document is updated at the end of every phase. It reflects the state
-of the system as of **Phase 5: Kafka Event Publishing**.
+of the system as of **Phase 6: Observability**.
 
 ## System overview
 
@@ -20,7 +20,13 @@ posting and balance-reading paths are proven correct under real concurrent
 access (see "Concurrency" below). As of Phase 5, every successfully
 committed `JournalEntry` publishes a Kafka event so downstream systems can
 react to ledger activity without coupling to the posting path directly
-(see "Event Publishing" below); no consumer exists yet (see Roadmap).
+(see "Event Publishing" below); no consumer exists yet (see Roadmap). As
+of Phase 6, the running application is inspectable from the outside:
+structured logs correlate every log line to the request that produced it,
+Micrometer metrics answer specific operational questions about posting,
+balance reads, and Kafka publishing, and `/actuator/health` distinguishes
+database and Kafka availability as separate components (see
+"Observability" below).
 
 ## Package structure
 
@@ -67,7 +73,21 @@ src/main/java/com/abel/ledger/
                                     beans, explicit producer configuration
     LedgerEventPublisher.java      @TransactionalEventListener(AFTER_COMMIT);
                                     the only class that knows about Kafka
-                                    message shape/topic/key
+                                    message shape/topic/key; also records
+                                    ledger.kafka.publish.* metrics and
+                                    structured logs — see "Observability"
+  observability/                 cross-cutting instrumentation — see
+                                  "Observability" below
+    CorrelationIdFilter.java       reads/generates X-Correlation-ID, puts
+                                    it in MDC, echoes it in the response
+    Uuid7Generator.java             hand-rolled RFC 9562 UUIDv7 generator
+                                    (java.util.UUID has no v7 support)
+    PostingObservabilityAspect.java @Around advice on PostingService.post /
+                                    recoverFromConcurrentIdempotencyKeyInsert
+                                    — zero changes to PostingService itself
+    BalanceObservabilityAspect.java @Around advice on
+                                    BalanceService.getBalance
+    KafkaHealthIndicator.java      custom /actuator/health "kafka" component
   api/                          the REST layer — see "API layer structure" below
     controller/
       JournalEntryController.java
@@ -82,6 +102,8 @@ src/main/java/com/abel/ledger/
 src/main/resources/
   application.yml               base configuration
   application-dev.yml           local development overrides
+  logback-spring.xml            plain-text (default) vs. JSON (json-logs
+                                 profile) log output — see "Observability"
   db/migration/                 Flyway migrations
 src/test/java/com/abel/ledger/
   LedgerApplicationTests.java   context load + smoke tests
@@ -103,6 +125,19 @@ src/test/java/com/abel/ledger/
     LedgerEventPublishingIntegrationTest.java  @EmbeddedKafka integration
                                                 tests — see "Event Publishing"
                                                 below
+  observability/
+    CorrelationIdFilterIntegrationTest.java   MockMvc — header round-trip,
+                                               generated-id UUIDv7 validity,
+                                               MDC cleared after the request
+    Uuid7GeneratorTest.java                   version/variant bits, uniqueness
+    PostingObservabilityIntegrationTest.java  metrics + ListAppender-captured
+                                               structured log fields for the
+                                               posting path
+    BalanceObservabilityIntegrationTest.java  metrics for the balance-read path
+    KafkaHealthIndicatorTest.java             UP (real broker) / DOWN
+                                               (unreachable address) health
+    HealthEndpointIntegrationTest.java        MockMvc — /actuator/health
+                                               component-level status
   api/controller/
     JournalEntryControllerIntegrationTest.java   MockMvc, real HTTP request/response
     AccountControllerIntegrationTest.java        MockMvc, real HTTP request/response
@@ -339,6 +374,19 @@ same three tables above, via the same repositories.
   a Kafka message only once Spring confirms the transaction actually
   committed, which is exactly the guarantee "publish iff committed" needs
   without any manual rollback-detection code.
+- **AOP for `PostingService`/`BalanceService` observability, direct
+  instrumentation for `LedgerEventPublisher`'s** (Phase 6). See
+  "Observability" below. In short: `PostingObservabilityAspect` and
+  `BalanceObservabilityAspect` add metrics and structured logging around
+  synchronous, easily-wrapped method calls without a single line of diff
+  to `PostingService.java`/`BalanceService.java` — the strongest possible
+  proof that no behavior changed. `LedgerEventPublisher`'s Kafka publish
+  outcome is determined asynchronously inside a `CompletableFuture`
+  callback, which an `@Around` advice around the method call cannot
+  observe (the method returns long before the callback fires), so that
+  one class is directly instrumented instead — still purely additive,
+  per this phase's explicit allowance for "logging statements, metric
+  recording" in that class.
 
 ## Concurrency
 
@@ -978,6 +1026,364 @@ embedded broker) covers the three correctness requirements end to end:
   request twice (same `idempotencyKey`, same payload) produces exactly
   one Kafka record, not two.
 
+## Observability
+
+Phase 6's job was to make the running application's behavior inspectable
+from the outside — structured logs, meaningful metrics, accurate health
+reporting — without changing any existing business logic.
+`PostingService`, `BalanceService`, and `LedgerEventPublisher`'s core
+logic have zero behavioral changes this phase; every file in
+`com.abel.ledger.observability` is purely additive instrumentation (see
+"Key design decisions" above for why AOP was used for two of those three
+classes and direct instrumentation for the third).
+
+### Structured logging
+
+**Plain text by default, JSON via the `json-logs` profile.**
+`logback-spring.xml` defines two `<springProfile>`-gated variants of the
+same `CONSOLE` appender: the default (any profile except `json-logs`)
+uses a human-readable pattern; `json-logs` swaps in
+`net.logstash.logback.encoder.LogstashEncoder`. The split exists because
+the two audiences want different things from the same information — a
+developer running the app locally is visually scanning scrolling output
+at a terminal, where a dense, grep-friendly text line is faster to read
+than JSON; a production deployment's logs are consumed by a log
+aggregator (ELK, Loki, CloudWatch Logs Insights, Datadog, ...) that wants
+one JSON object per line with fields it can index and query on, where
+human-readability of the raw stream doesn't matter. Defaulting to plain
+text and opting into JSON (rather than the reverse) matches this
+project's actual usage so far: every `docker compose`/`mvnw` invocation
+in this repo's history has been local development, and a real deployment
+is expected to explicitly set `SPRING_PROFILES_ACTIVE` to include
+`json-logs` (see "How to Monitor This Service" below).
+
+**One log statement, two renderings.** Every structured field in this
+phase's log statements is passed via
+`net.logstash.logback.argument.StructuredArguments.kv("key", value)` as
+an SLF4J message argument, with a matching `{}` placeholder in the
+message template (e.g. `log.info("Journal entry posted {} {} {}",
+kv("journalEntryId", id), kv("idempotencyKey", key), kv("referenceId",
+ref))`). `StructuredArguments.kv(...).toString()` renders as
+`"key=value"`, which is what substitutes into the `{}` placeholder in
+plain-text mode — so the same call site produces a readable
+`journalEntryId=... idempotencyKey=... referenceId=...` line at a
+terminal. Under `json-logs`, `LogstashEncoder` independently calls each
+argument's `writeTo(JsonGenerator)` and adds `journalEntryId`,
+`idempotencyKey`, and `referenceId` as top-level JSON fields — the exact
+mechanism `PostingObservabilityIntegrationTest` exercises directly (see
+"Testing" below) rather than parsing rendered text.
+
+**No sensitive data in plaintext logs, deliberately.** No log statement
+anywhere in this codebase logs a full account number
+(`Account.accountNumber`) or a monetary amount
+(`LedgerEntry.amount`/`PostingRequest`'s entry amounts). Only
+`journalEntryId`, `idempotencyKey`, `referenceId`, `accountId` (a UUID,
+not the human-assigned `accountNumber`), and exception details are
+logged. This is a deliberate boundary, not an oversight: `journalEntryId`
+and `accountId` are opaque, internally-generated UUIDs that are useless
+to an attacker without database access and are exactly what's needed to
+correlate a log line back to a specific record via the REST API or a
+direct query — but an account number (a business-meaningful, often
+externally-visible identifier) and a transaction amount are the kind of
+data a financial system's logs should minimize exposure of, since logs
+routinely have broader read access (log aggregators, on-call engineers,
+retention policies) than the database itself. A consumer that needs the
+actual amount is expected to call the REST API, which sits behind
+whatever authorization this project's still-pending Phase 7 (security)
+introduces — logs should not become a side channel that bypasses it.
+
+**MDC and `correlationId`.** `CorrelationIdFilter` (see below) places the
+correlation id in SLF4J's `MDC` under the key `correlationId` for the
+duration of a request. Every log statement, from every class, therefore
+gets `correlationId` "for free" — it's included in the plain-text pattern
+via `%X{correlationId:-none}` and in JSON output automatically, since
+`LogstashEncoder` includes all MDC entries as top-level fields by
+default. No log statement needs to explicitly pass `correlationId`.
+
+### Correlation id
+
+`CorrelationIdFilter` (`@Order(Ordered.HIGHEST_PRECEDENCE)`, so it runs
+before anything else, including the request-logging filter Spring Boot's
+`ServerHttpObservationFilter` installs) does three things per request:
+reads `X-Correlation-ID` from the incoming request if the client
+supplied one; generates a UUIDv7 via `Uuid7Generator` if not; puts it in
+MDC under `correlationId` for the lifetime of the request (cleared in a
+`finally` block, so it can never leak into a later request handled on a
+reused thread — `CorrelationIdFilterIntegrationTest` asserts this
+directly); and echoes it back in the `X-Correlation-ID` response header
+either way, so a client that didn't supply one can still capture it for
+its own logs/support requests.
+
+**Why UUIDv7, not `UUID.randomUUID()` (v4).** A UUIDv7 embeds a 48-bit
+millisecond Unix timestamp in its first 48 bits, ahead of its random
+bits (see `Uuid7Generator`'s javadoc for the exact bit layout). This
+means UUIDv7 values sort — and therefore index — naturally by creation
+time, which is a genuinely useful property for a correlation id
+specifically: log storage and search tools that sort or partition by a
+lexicographically/numerically sortable id benefit from this, and it
+requires no library beyond what's already on the classpath — `java.util.UUID`
+just has no v7 constructor, so `Uuid7Generator` hand-assembles the 128
+bits per RFC 9562. `UUID.randomUUID()` (v4) has no such ordering
+property; every value is independent, uniformly-random noise with
+respect to when it was created.
+
+**Known limitation: correlation id can be absent from Kafka
+publish-failure logs.** `LedgerEventPublisher.onJournalEntryPosted` runs
+synchronously on the original request thread (as part of the
+`@TransactionalEventListener(AFTER_COMMIT)` callback chain — see "Event
+Publishing"), so `correlationId` is present in MDC and appears in the
+"Published ledger event to Kafka" / initial log context normally.
+However, the actual outcome of `kafkaTemplate.send(...)` is determined
+inside a `CompletableFuture.whenComplete(...)` callback, which — once the
+send is genuinely asynchronous — can run on the Kafka producer's own I/O
+thread (`kafka-producer-network-thread-...`) rather than the request
+thread. MDC is thread-local, so a callback that fires on a different
+thread simply won't see the request thread's `correlationId`. This is
+documented in `LedgerEventPublisher`'s `logPublishFailure` javadoc rather
+than "fixed," because fixing it would mean manually capturing and
+re-installing MDC context across the async boundary — real, but
+non-trivial, additional complexity that a portfolio project's Kafka
+failure logging doesn't currently warrant (the `journalEntryId` and
+`eventId` fields already in that log line are sufficient to find the
+right context by other means).
+
+### Metrics
+
+All business metrics live under the `ledger.` namespace and use tags
+(`outcome`, `failure_reason`) rather than a separate counter per outcome,
+so a single Prometheus query like
+`sum(rate(ledger_posting_requests_total[5m])) by (outcome)` answers "what
+fraction of postings are failing right now" without needing to know the
+metric names for every failure mode in advance.
+
+| Metric | Type | Tags | Operational question it answers |
+|---|---|---|---|
+| `ledger.posting.requests` | Counter | `outcome=success\|failure`, `failure_reason=unbalanced\|currency_mismatch\|idempotency_conflict\|account_not_found\|invalid_request\|unknown` (failure only) | How much posting traffic is succeeding vs. failing, and *why* it's failing, broken down by cause — is a spike in errors client-side bad requests (`unbalanced`/`invalid_request`), a data problem (`account_not_found`), or contention (`idempotency_conflict`)? |
+| `ledger.posting.duration` | Timer | `outcome=success\|failure` | Posting latency distribution (count/sum/max, and percentiles if a percentile histogram is later enabled) — is the posting engine slow, and does that correlate with success or failure? |
+| `ledger.balance.requests` | Counter | `outcome=success\|failure` | How much balance-read traffic there is and how often it fails (almost always `AccountNotFoundException` — a client querying a bad id). |
+| `ledger.balance.duration` | Timer | `outcome=success\|failure` | Balance-read latency — since this is a live `SUM` aggregation query with no caching (see "No stored balance column"), this is the metric to watch as `ledger_entries` grows. |
+| `ledger.kafka.publish.requests` | Counter | `outcome=success\|failure` | Is the ledger's event stream actually keeping up — are events reaching Kafka, or silently failing (see "Failure Handling" in "Event Publishing")? |
+| `ledger.kafka.publish.duration` | Timer | `outcome=success\|failure` | Kafka publish latency — since `KafkaTemplate.send()` is non-blocking, this measures the producer's own send-to-ack time, not request latency. |
+| `ledger.idempotency.conflicts` | Counter | none | How often a client reuses an `idempotencyKey` with a genuinely different payload (`IdempotencyKeyConflictException`) — a signal of a likely client-side bug (reusing a key across unrelated requests), distinct from the expected, harmless case of retrying the *same* payload. |
+| `ledger.concurrency.recoveries` | Counter | none | How often the concurrency-race recovery path (see "Concurrency") is actually exercised in practice — near-zero in normal traffic, rising under genuine concurrent retry storms; a sustained high rate would suggest clients are retrying far more aggressively than expected. |
+
+`ledger.posting.requests`/`ledger.posting.duration` and
+`ledger.concurrency.recoveries` are recorded by
+`PostingObservabilityAspect`; `ledger.idempotency.conflicts` is recorded
+in the same `@Around` advice around `post()`, since
+`IdempotencyKeyConflictException` can originate from either the
+sequential-replay path or the concurrency-recovery path and both are
+caught by that one advice regardless of which internal method raised it.
+`ledger.balance.*` is recorded by `BalanceObservabilityAspect`.
+`ledger.kafka.publish.*` is recorded directly inside
+`LedgerEventPublisher` (see "Key design decisions" above for why).
+
+Beyond these custom metrics, Spring Boot Actuator's Micrometer
+integration automatically provides (no code required, since
+`spring-boot-starter-actuator` + `micrometer-registry-prometheus` are on
+the classpath and `management.endpoints.web.exposure.include` lists
+`metrics` and `prometheus`):
+
+- **HTTP request metrics** (`http.server.requests`, exposed to
+  Prometheus as `http_server_requests_seconds_*`) — latency and count
+  tagged by `uri`, `method`, `status`, and `outcome`, covering every
+  endpoint including the ones this phase didn't touch.
+- **JVM metrics** (`jvm.memory.*`, `jvm.gc.*`, `jvm.threads.*`) — heap/
+  non-heap memory by pool, GC pause time, live thread count.
+- **DataSource/HikariCP metrics** (`hikaricp.connections.*`) — active/
+  idle/pending connection counts against the pool sized in "Concurrency"
+  above — the metric to watch if that pool sizing ever needs revisiting.
+
+### Prometheus
+
+`/actuator/prometheus` is exposed via `micrometer-registry-prometheus`
+(added this phase) and `management.endpoints.web.exposure.include:
+health,info,metrics,prometheus` in `application.yml`. Every metric above
+— custom and Boot-provided alike — appears in that one scrape response,
+in standard Prometheus text exposition format (dots become underscores,
+`_total`/`_seconds` suffixes are added per Prometheus naming convention,
+e.g. `ledger.posting.requests` → `ledger_posting_requests_total`). See
+"How to Monitor This Service" below for a real captured example and a
+sample scrape config.
+
+`management.metrics.tags.application: ${spring.application.name}` tags
+every metric (custom and built-in) with `application="double-entry-ledger"`,
+so metrics from this service are distinguishable from any other service's
+in a shared Prometheus instance without needing a separate `job` label
+convention per team.
+
+### Health checks
+
+`/actuator/health` (present since Phase 0/3, previously reporting only
+`db` implicitly via Boot's auto-configured `DataSourceHealthIndicator`)
+now reports `db`, `kafka`, `diskSpace`, and `ping` as separate components,
+each with its own `status` and `details`, using Actuator's standard
+composite-health-indicator conventions — `show-details: always` (already
+set since Phase 3) means the full breakdown, not just the aggregate
+status, is always visible:
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "db": { "status": "UP", "details": { "database": "PostgreSQL", "validationQuery": "isValid()" } },
+    "kafka": { "status": "UP", "details": { "bootstrapServers": ["localhost:9092"], "clusterId": "...", "nodeCount": 1 } },
+    "diskSpace": { "status": "UP", "details": { "...": "..." } },
+    "ping": { "status": "UP" }
+  }
+}
+```
+
+**`KafkaHealthIndicator` (new this phase)** calls
+`AdminClient.describeCluster()` against the same `KafkaAdmin` bean the
+rest of the app's Kafka configuration is built from, bounded by a 2
+-second timeout so an unreachable broker reports DOWN quickly rather than
+hanging the endpoint. It replaces Spring Boot's own auto-configured Kafka
+health indicator (kept off via `management.health.kafka.enabled: false`,
+originally disabled in Phase 3 when no Kafka publishing existed at all —
+now kept off specifically to avoid two indicators both claiming the
+`kafka` component name, not because Kafka health reporting is unwanted).
+
+**No custom database health indicator was written.** Spring Boot's
+auto-configured `DataSourceHealthIndicator` already does exactly what
+this phase needs — a real validation query (`Connection.isValid()`)
+against the actual `DataSource` bean, reporting UP/DOWN with database
+product details — and has been present, correct, and exercised by every
+integration test in this project since Phase 1. Writing a second,
+custom database indicator would only duplicate it with no behavioral
+difference; the honest, non-redundant choice was to document that
+decision rather than write code whose only purpose would be to exist.
+
+**Deliberate tradeoff: a down Kafka broker makes the overall
+`/actuator/health` status DOWN, even though posting still works without
+Kafka** (per Phase 5's explicit design — a publish failure never fails a
+post). This is standard Actuator composite-health behavior (overall
+status = worst of all components) and was kept as-is rather than
+building a custom health group to separate "can this instance serve
+traffic" from "is every dependency healthy," because this phase didn't
+ask for Kubernetes-probe-specific behavior and building that grouping
+without a concrete consumer for it would be speculative complexity. The
+practical implication for an operator: a DOWN `kafka` component means
+"ledger events aren't being published," not "the ledger is broken" —
+check `components.db.status` specifically to know whether posting itself
+is affected. If this project ever adds liveness/readiness-probe-specific
+behavior, Spring Boot's `management.endpoint.health.group.*` 
+configuration (splitting `db` into a "readiness" group that excludes
+`kafka`) is the standard mechanism to reach for.
+
+### Testing
+
+**Logging Verification** uses a Logback `ch.qos.logback.core.read.ListAppender`
+(a real, public, purpose-built test utility bundled in `logback-core` —
+no custom hand-rolled appender needed), attached directly to the logger
+under test (e.g. `com.abel.ledger.observability.posting`) in `@BeforeEach`
+and detached in `@AfterEach`. Rather than asserting on the *rendered*
+log line (brittle: sensitive to message wording, pattern changes, or
+plain-text-vs-JSON mode), `PostingObservabilityIntegrationTest` walks
+each captured `ILoggingEvent`'s `getArgumentArray()`, filters for
+`net.logstash.logback.argument.StructuredArgument` instances, and calls
+each one's own `writeTo(JsonGenerator)` — the exact method
+`LogstashEncoder` itself calls in production — to render them into a
+field map, then asserts on that map directly (`containsEntry("journalEntryId", ...)`).
+This tests the actual structured-data contract a real JSON log line would
+carry, independent of message wording.
+
+**Correlation id propagation** is verified via `MockMvc` in
+`CorrelationIdFilterIntegrationTest`: a supplied `X-Correlation-ID` is
+echoed back unchanged; an omitted one produces a generated, valid UUIDv7
+in the response header (`UUID.fromString(...).version() == 7`); and MDC
+is confirmed empty immediately after the request completes.
+
+**Metrics** are verified against the real, Spring-managed `MeterRegistry`
+bean (`PostingObservabilityIntegrationTest`, `BalanceObservabilityIntegrationTest`,
+`LedgerEventPublisherTest`) using a capture-before/act/assert-delta-of-1
+pattern rather than asserting an absolute count — necessary because
+`MeterRegistry` is a singleton shared across the whole test suite (many
+other test classes call `postingService.post(...)` too), so an absolute
+count would be flaky depending on test execution order.
+`meterRegistry.counter(name, tags...)` / `.timer(name, tags...)` (a
+register-or-get lookup — the same idiom the aspects themselves use) is
+used to capture the Counter/Timer reference *before* the operation,
+specifically to avoid `MeterRegistry.get(name).tags(...).counter()`,
+which throws `MeterNotFoundException` if that exact tag combination has
+never been recorded yet (a real failure mode hit and fixed while writing
+these tests, for the `failure_reason` tags that don't exist in a fresh
+registry until the first failure of each kind occurs).
+
+**Health checks** are verified two ways: `HealthEndpointIntegrationTest`
+(MockMvc, real docker-compose Postgres + Kafka, both healthy) proves the
+end-to-end wiring — `components.db.status`/`components.kafka.status`
+both present and `UP`; `KafkaHealthIndicatorTest` exercises
+`KafkaHealthIndicator` directly, in isolation, against both the real
+broker (UP) and a deliberately unreachable address (`localhost:1`, a
+reserved port nothing listens on — DOWN, with an `error` detail),
+without needing to actually stop the shared docker-compose Kafka
+container the rest of the suite depends on.
+
+## How to Monitor This Service
+
+### Actuator endpoints
+
+With `management.endpoints.web.exposure.include: health,info,metrics,prometheus`
+(`application.yml`), this service exposes:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /actuator/health` | Overall + per-component (`db`, `kafka`, `diskSpace`, `ping`) status. `show-details: always`, so the full breakdown is always visible — see "Health checks" above. |
+| `GET /actuator/info` | Application metadata (currently minimal — no custom `InfoContributor` has been added). |
+| `GET /actuator/metrics` | Lists all available Micrometer metric names. |
+| `GET /actuator/metrics/{name}` | A single metric's measurements and available tags, e.g. `GET /actuator/metrics/ledger.posting.requests`. |
+| `GET /actuator/prometheus` | Every metric (custom `ledger.*` and Boot-provided JVM/HTTP/datasource) in Prometheus text exposition format. |
+
+### Example Prometheus scrape configuration
+
+```yaml
+scrape_configs:
+  - job_name: double-entry-ledger
+    metrics_path: /actuator/prometheus
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:8080"]
+```
+
+### Example log output
+
+A successful posting, captured from a real running instance of this
+exact code (`POST /api/v1/journal-entries` with header
+`X-Correlation-ID: json-verify-1`):
+
+**Plain text (default):**
+
+```
+2026-07-08T20:33:00.940-07:00 INFO  [http-nio-8081-exec-2] c.abel.ledger.observability.posting [correlationId=json-verify-1] - Journal entry posted journalEntryId=bdf3e0ec-f2b3-47eb-98de-04f0aaead87f idempotencyKey=idem-d9a68777-5a92-43f3-9607-1a6f96688c2f referenceId=REF-462a5fed-ca08-41df-ad3a-d97847506ba3
+```
+
+**JSON (`--spring.profiles.active=json-logs`, or
+`SPRING_PROFILES_ACTIVE=json-logs` as an env var):**
+
+```json
+{
+  "@timestamp": "2026-07-08T20:46:22.327411-07:00",
+  "@version": "1",
+  "message": "Journal entry posted journalEntryId=588cf062-b186-4eca-8b16-f87f810569ba idempotencyKey=json-idem-1 referenceId=JSON-REF-1",
+  "logger_name": "com.abel.ledger.observability.posting",
+  "thread_name": "http-nio-8081-exec-2",
+  "level": "INFO",
+  "level_value": 20000,
+  "correlationId": "json-verify-1",
+  "journalEntryId": "588cf062-b186-4eca-8b16-f87f810569ba",
+  "idempotencyKey": "json-idem-1",
+  "referenceId": "JSON-REF-1",
+  "service": "double-entry-ledger"
+}
+```
+
+Note that in JSON mode, `journalEntryId`/`idempotencyKey`/`referenceId`
+appear both inside the rendered `message` text (harmless — the
+`StructuredArguments.kv(...)` call renders "key=value" either way) *and*
+as independent, queryable top-level fields — the dual-rendering behavior
+described in "Structured logging" above.
+
 ## Roadmap
 
 - **Phase 0** (done): runnable scaffold, health endpoint, infra wiring.
@@ -994,13 +1400,20 @@ embedded broker) covers the three correctness requirements end to end:
   explicit locking is needed for this append-only, no-stored-balance
   schema; added `PostingServiceConcurrencyTest` and the manual
   `PostingServiceStressCheck`.
-- **Phase 5** (this phase): publish a `ledger.journal-entry.posted.v1`
+- **Phase 5** (done): publish a `ledger.journal-entry.posted.v1`
   Kafka event whenever a `JournalEntry` commits, via a domain event
   (`JournalEntryPostedEvent`) raised by `PostingService` and converted to
   a Kafka message by a separate `@TransactionalEventListener(AFTER_COMMIT)`
   (`LedgerEventPublisher`); no consumer yet, publishing only. Documented
   the Outbox Pattern as the future migration path if reliability
   requirements increase.
-- **Later phases** (not yet requested): production readiness work —
-  the core ledger implementation (domain model, posting engine, REST API,
-  concurrency correctness, event publishing) is now complete.
+- **Phase 6** (this phase): structured logging (plain text by default,
+  JSON via the `json-logs` profile, both from the same log statements),
+  a `CorrelationIdFilter` propagating `X-Correlation-ID` through MDC,
+  `ledger.*` business metrics alongside Boot's automatic HTTP/JVM/
+  datasource metrics, `/actuator/prometheus`, and a custom `kafka` health
+  indicator distinguishing database and Kafka availability — all added
+  via AOP or purely-additive edits, with zero behavioral changes to
+  `PostingService`/`BalanceService`/`LedgerEventPublisher`.
+- **Later phases** (not yet requested): Phase 7 (security), Phase 8
+  (production hardening) — do not begin without explicit request.
