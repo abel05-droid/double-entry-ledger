@@ -7,6 +7,12 @@ spring:
     username: ${DB_USERNAME:ledger}
     password: ${DB_PASSWORD:ledger}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      # Sized for a posting engine expected to take concurrent write traffic
+      # (see docs/architecture.md, "Concurrency"): the default of 10 is
+      # tuned for a low-traffic service, not one designed to accept many
+      # simultaneous postings.
+      maximum-pool-size: 20
 
   jpa:
     open-in-view: false

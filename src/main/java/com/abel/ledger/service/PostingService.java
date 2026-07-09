@@ -32,6 +32,9 @@ import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.CollectionUtils;
@@ -40,12 +43,31 @@ import org.springframework.util.StringUtils;
 /**
  * Validates and posts complete, balanced double-entry transactions.
  *
- * {@link #post(PostingRequest)} is the sole entry point into the posting
- * engine and the sole {@code @Transactional} boundary in this class: a
- * journal entry and all of its ledger entries are validated and persisted
- * atomically, or nothing is persisted at all. Posted records are never
- * updated or deleted — corrections happen by posting a new, separate
- * correcting transaction.
+ * {@link #postWithinTransaction(PostingRequest)} is the sole
+ * {@code @Transactional} write boundary in this class: a journal entry and
+ * all of its ledger entries are validated and persisted atomically, or
+ * nothing is persisted at all. Posted records are never updated or deleted
+ * — corrections happen by posting a new, separate correcting transaction.
+ *
+ * <p>{@link #post(PostingRequest)} is the public entry point. It wraps that
+ * transactional attempt with recovery for exactly one concurrency race: two
+ * requests carrying the same {@code idempotencyKey} both pass the
+ * check-then-act {@code findByIdempotencyKey} lookup before either commits
+ * (unavoidable under {@code READ COMMITTED}, and not worth escalating
+ * isolation to close — see {@code docs/architecture.md}). The loser's
+ * transaction then fails a unique-constraint check at commit — either on
+ * {@code idempotency_keys.idempotency_key} directly, or, if the racing
+ * requests also share a {@code referenceId} (the common case: the same
+ * logical request retried), on {@code journal_entries.reference_id} first,
+ * since that insert happens earlier in the method. Either way the whole
+ * losing transaction rolls back atomically, so no duplicate
+ * {@code JournalEntry} or orphaned {@code LedgerEntry} rows are ever
+ * possible. {@link #recoverFromConcurrentIdempotencyKeyInsert} distinguishes
+ * "this failure was that race" from "this is a genuine, unrelated conflict"
+ * by checking whether an {@code idempotency_keys} row for this exact
+ * request's key now exists — not by matching a specific constraint name —
+ * and, if so, replays the winner's result instead of surfacing a 500 to a
+ * client that did nothing wrong.
  */
 @Service
 public class PostingService {
@@ -55,21 +77,49 @@ public class PostingService {
     private final AccountRepository accountRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
 
+    /**
+     * Self-reference used to invoke the {@code @Transactional} methods
+     * below through Spring's proxy rather than via a plain {@code this}
+     * call, which would silently bypass the proxy (and therefore the
+     * transaction) entirely. {@code @Lazy} breaks the resulting circular
+     * dependency by injecting a lazily-resolved proxy instead of eagerly
+     * instantiating this bean while it's still being constructed.
+     */
+    private final PostingService self;
+
     public PostingService(
             JournalEntryRepository journalEntryRepository,
             LedgerEntryRepository ledgerEntryRepository,
             AccountRepository accountRepository,
             IdempotencyKeyRepository idempotencyKeyRepository) {
+        this(journalEntryRepository, ledgerEntryRepository, accountRepository, idempotencyKeyRepository, null);
+    }
+
+    @Autowired
+    public PostingService(
+            JournalEntryRepository journalEntryRepository,
+            LedgerEntryRepository ledgerEntryRepository,
+            AccountRepository accountRepository,
+            IdempotencyKeyRepository idempotencyKeyRepository,
+            @Lazy PostingService self) {
         this.journalEntryRepository = journalEntryRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
         this.accountRepository = accountRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
+        this.self = self != null ? self : this;
+    }
+
+    public PostingResult post(PostingRequest request) {
+        validateStructure(request);
+        try {
+            return self.postWithinTransaction(request);
+        } catch (DataIntegrityViolationException ex) {
+            return self.recoverFromConcurrentIdempotencyKeyInsert(request, ex);
+        }
     }
 
     @Transactional
-    public PostingResult post(PostingRequest request) {
-        validateStructure(request);
-
+    public PostingResult postWithinTransaction(PostingRequest request) {
         String fingerprint = fingerprint(request);
         Optional<IdempotencyKey> existingKey = idempotencyKeyRepository.findByIdempotencyKey(request.idempotencyKey());
         if (existingKey.isPresent()) {
@@ -104,6 +154,34 @@ public class PostingService {
                         .build());
 
         return toResult(journalEntry, savedEntries);
+    }
+
+    /**
+     * Recovers from a losing concurrency race on this request's
+     * idempotencyKey: by the time this runs, {@code postWithinTransaction}'s
+     * whole attempt (journal entry, ledger entries, and the idempotency key
+     * insert) has already been rolled back atomically, so the only trace of
+     * this attempt is the exception itself. This is deliberately
+     * distinguished from a genuine, unrelated conflict (e.g. a
+     * {@code reference_id} collision between two requests with different
+     * idempotencyKeys, as in {@code PostingServiceIntegrationTest
+     * .duplicateReferenceIdViolatesDatabaseConstraintAndRollsBackCompletely})
+     * not by matching a specific constraint name, but by checking whether an
+     * {@code idempotency_keys} row now exists for THIS request's key: if the
+     * race was on the shared {@code referenceId} of two requests carrying the
+     * same idempotencyKey, that row belongs to the winner, who reached and
+     * committed the idempotency key insert before this transaction's earlier
+     * {@code reference_id} insert could even fail. If no such row exists,
+     * this failure had nothing to do with a race on this key — rethrow it
+     * unchanged.
+     */
+    @Transactional(readOnly = true)
+    public PostingResult recoverFromConcurrentIdempotencyKeyInsert(
+            PostingRequest request, DataIntegrityViolationException raceCause) {
+        String fingerprint = fingerprint(request);
+        IdempotencyKey winningKey = idempotencyKeyRepository.findByIdempotencyKey(request.idempotencyKey())
+                .orElseThrow(() -> raceCause);
+        return replay(winningKey, fingerprint);
     }
 
     private PostingResult replay(IdempotencyKey existingKey, String fingerprint) {
