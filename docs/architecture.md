@@ -1,7 +1,7 @@
 # Architecture
 
 This document is updated at the end of every phase. It reflects the state
-of the system as of **Phase 4: Concurrency and Transaction Isolation**.
+of the system as of **Phase 5: Kafka Event Publishing**.
 
 ## System overview
 
@@ -17,8 +17,10 @@ transaction, never by editing or deleting history.
 As of Phase 3, the service exposes its posting and query engine over a
 REST API (`/api/v1`) documented with OpenAPI/Swagger. As of Phase 4, the
 posting and balance-reading paths are proven correct under real concurrent
-access (see "Concurrency" below); Kafka publishing is still deferred (see
-Roadmap).
+access (see "Concurrency" below). As of Phase 5, every successfully
+committed `JournalEntry` publishes a Kafka event so downstream systems can
+react to ledger activity without coupling to the posting path directly
+(see "Event Publishing" below); no consumer exists yet (see Roadmap).
 
 ## Package structure
 
@@ -45,12 +47,27 @@ src/main/java/com/abel/ledger/
                                  failures raised by the service layer
                                  (PostingService/BalanceService/
                                  LedgerQueryService)
+  event/
+    JournalEntryPostedEvent.java   plain-Java domain event, no Kafka
+                                    dependency — see "Event Publishing" below
   repository/                   Spring Data JPA repositories, one per
                                  aggregate (flat, not nested under domain/)
   service/
-    PostingService.java         validates and atomically posts transactions
+    PostingService.java         validates and atomically posts transactions;
+                                 raises JournalEntryPostedEvent on success
     BalanceService.java         derives account balances via live SQL aggregation
     LedgerQueryService.java     read-only journal entry / ledger entry lookups
+  kafka/                        turns domain events into Kafka messages —
+                                 see "Event Publishing" below
+    LedgerKafkaTopics.java         topic name constants
+    JournalEntryPostedMessage.java the public JSON wire schema (eventId,
+                                    eventVersion, journalEntryId, referenceId,
+                                    postedAt, affectedAccountIds)
+    LedgerKafkaProducerConfig.java dedicated ProducerFactory/KafkaTemplate
+                                    beans, explicit producer configuration
+    LedgerEventPublisher.java      @TransactionalEventListener(AFTER_COMMIT);
+                                    the only class that knows about Kafka
+                                    message shape/topic/key
   api/                          the REST layer — see "API layer structure" below
     controller/
       JournalEntryController.java
@@ -81,6 +98,11 @@ src/test/java/com/abel/ledger/
                                           default test-discovery patterns so
                                           `mvn test` never runs it — see
                                           "Concurrency" below
+  kafka/
+    LedgerEventPublisherTest.java             unit test, mocked KafkaTemplate
+    LedgerEventPublishingIntegrationTest.java  @EmbeddedKafka integration
+                                                tests — see "Event Publishing"
+                                                below
   api/controller/
     JournalEntryControllerIntegrationTest.java   MockMvc, real HTTP request/response
     AccountControllerIntegrationTest.java        MockMvc, real HTTP request/response
@@ -309,6 +331,14 @@ same three tables above, via the same repositories.
   that already existed since Phase 2, plus a catch-and-replay recovery
   added in `PostingService.post()` this phase so the losing request
   gets the winner's result instead of an unhandled 500.
+- **`@TransactionalEventListener(AFTER_COMMIT)` instead of publishing to
+  Kafka inline in `PostingService`** (Phase 5). See "Event Publishing"
+  below for the full analysis. In short: `PostingService` raises a plain
+  Java domain event through Spring's `ApplicationEventPublisher` and stays
+  entirely unaware of Kafka; a separate listener converts that event into
+  a Kafka message only once Spring confirms the transaction actually
+  committed, which is exactly the guarantee "publish iff committed" needs
+  without any manual rollback-detection code.
 
 ## Concurrency
 
@@ -609,6 +639,345 @@ Postgres:
 
 with all ledger invariants holding afterward.
 
+## Event Publishing
+
+Phase 5's job was to publish a Kafka event whenever a `JournalEntry` is
+successfully posted, so downstream systems could eventually react to
+ledger activity without coupling to the posting path directly —
+publishing only, no consumer.
+
+### Correctness requirements
+
+1. An event is published if and only if the `JournalEntry`'s transaction
+   actually committed. A rolled-back posting attempt (unbalanced entries,
+   currency mismatch, a concurrency-race loser, or any other failure)
+   must never result in a published event.
+2. Publishing failures must never cause a successful posting operation to
+   appear failed to the caller — the HTTP response for a successful post
+   does not depend on whether the Kafka publish succeeded.
+3. An idempotent replay (same `idempotencyKey`, same payload, no new row
+   created) must not publish a duplicate event for the same `JournalEntry`.
+
+### Domain event vs. Kafka event: why two types, not one
+
+`PostingService` raises `com.abel.ledger.event.JournalEntryPostedEvent` —
+a plain Java record (`journalEntryId`, `referenceId`, `postedAt`,
+`affectedAccountIds`) with no Kafka, JSON, or messaging dependency of any
+kind — through Spring's own `ApplicationEventPublisher`. `PostingService`
+has no dependency on Kafka producer types, `spring-kafka`, or even the
+concept of a "topic"; it only knows that "a journal entry was posted" is
+a fact worth telling the rest of the application about.
+
+`com.abel.ledger.kafka.LedgerEventPublisher` is a separate `@Component`
+that listens for that domain event and is solely responsible for turning
+it into `com.abel.ledger.kafka.JournalEntryPostedMessage` (the actual
+Kafka JSON payload, which additionally carries `eventId` and
+`eventVersion` — publishing-mechanism concerns that don't belong on the
+domain event) and sending it to Kafka. This split means: if a second
+consumer of "a journal entry was posted" ever needs to exist in-process
+(e.g. a future audit-log writer), it can listen for the same domain event
+without touching `PostingService` or knowing Kafka is involved at all;
+and `PostingService` unit tests (`PostingServiceTest`) can assert an
+event was raised using a plain mocked `ApplicationEventPublisher`, with
+no Kafka test infrastructure whatsoever.
+
+### The after-commit mechanism: `@TransactionalEventListener(phase = AFTER_COMMIT)`
+
+This is the single mechanism that satisfies correctness requirement 1,
+and it's a built-in Spring primitive, not custom code.
+`PostingService.postWithinTransaction` calls
+`eventPublisher.publishEvent(...)` as its last step, immediately after
+the `IdempotencyKey` row is saved — while its surrounding
+`@Transactional` transaction is still open, i.e. *before* that
+transaction has actually committed. Spring does not invoke a
+`@TransactionalEventListener(phase = AFTER_COMMIT)` method synchronously
+at `publishEvent()` time; instead it registers a
+`TransactionSynchronization` against the current transaction and only
+invokes the listener from that synchronization's `afterCommit()`
+callback — which Spring only calls once the transaction has actually
+committed successfully. If the transaction instead rolls back for any
+reason (an unbalanced-entries or currency-mismatch validation failure,
+or the concurrency-race loser described in "Concurrency" above, whose
+`postWithinTransaction` call rolls back before ever raising the event, or
+rolls back *after* raising it but before commit — either way), Spring
+discards the queued event without ever invoking `LedgerEventPublisher`.
+No manual "did this actually commit" bookkeeping is needed anywhere in
+this codebase; the annotation *is* the mechanism.
+
+Requirement 3 (no duplicate event on idempotent replay) falls out of the
+same design without any extra idempotency check in the Kafka layer:
+`PostingService`'s `replay()` method — used both for a same-transaction
+idempotency-key hit and for `recoverFromConcurrentIdempotencyKeyInsert`'s
+recovery path — never calls `publishEvent()` at all. A replay simply
+never reaches the one line in `postWithinTransaction` that raises the
+event, so there is nothing for `LedgerEventPublisher` to receive twice.
+`LedgerEventPublishingIntegrationTest.publishesExactlyOneEventAcrossAnIdempotentReplay`
+proves this directly: posting the same request twice yields exactly one
+Kafka record.
+
+Requirement 2 (a publish failure can't fail a successful post) is
+satisfied by `LedgerEventPublisher.onJournalEntryPosted` never throwing:
+every path — a synchronous exception from `kafkaTemplate.send(...)`
+(e.g. a serialization failure) and an asynchronous failure surfaced via
+the returned `CompletableFuture` (e.g. the broker being unreachable) — is
+caught and logged, never rethrown. Combined with the fact that
+`KafkaTemplate.send()` itself is non-blocking (it hands off to the
+producer's internal buffer and returns a future immediately, rather than
+blocking on a broker acknowledgment), the listener adds negligible
+latency to the request and can never turn a committed post into an
+apparent failure. `LedgerEventPublisherTest` proves this at the unit
+level with a mocked `KafkaTemplate` that throws synchronously and one
+that returns an exceptionally-completed future — both leave
+`onJournalEntryPosted` returning normally.
+
+### Event flow
+
+```
+POST /api/v1/journal-entries
+        │
+        ▼
+PostingService.post()
+        │
+        ▼
+postWithinTransaction()  (@Transactional)
+  ├─ persist JournalEntry
+  ├─ persist LedgerEntry rows
+  ├─ persist IdempotencyKey
+  └─ eventPublisher.publishEvent(JournalEntryPostedEvent)
+        │  (queued against the current transaction, not delivered yet)
+        ▼
+   ── transaction commits ──
+        │
+        ▼
+LedgerEventPublisher.onJournalEntryPosted()   (@TransactionalEventListener,
+        │                                       phase = AFTER_COMMIT)
+        ▼
+builds JournalEntryPostedMessage (eventId, eventVersion, journalEntryId,
+                                   referenceId, postedAt, affectedAccountIds)
+        │
+        ▼
+KafkaTemplate<String, JournalEntryPostedMessage>.send(...)
+        │  key = journalEntryId.toString()
+        ▼
+   ledger.journal-entry.posted.v1
+```
+
+If `postWithinTransaction` throws instead of reaching the commit step
+(unbalanced entries, currency mismatch, an unrelated constraint
+violation, or the transaction otherwise failing to commit), the flow
+stops before "transaction commits" and `LedgerEventPublisher` is never
+invoked — no message ever reaches the topic.
+
+### Event schema and versioning
+
+`JournalEntryPostedMessage` (`com.abel.ledger.kafka`) is the JSON payload:
+
+```json
+{
+  "eventId": "b3f1...",
+  "eventVersion": 1,
+  "journalEntryId": "a1c2...",
+  "referenceId": "REF-2026-001",
+  "postedAt": "2026-07-09T02:35:28.681Z",
+  "affectedAccountIds": ["8d8e...", "2e70..."]
+}
+```
+
+Deliberately excluded: `LedgerEntry` details and monetary amounts. This
+event is a *notification* ("a journal entry was posted, here's its id"),
+not a data feed — a consumer that needs the actual debit/credit lines and
+amounts is expected to call `GET /api/v1/journal-entries/{journalEntryId}`
+using the id in the event. This keeps the REST API as the single source
+of truth for financial data, rather than creating a second copy of it
+(amounts, entry types) inside the event stream that would need its own
+independent correctness guarantees and would double the surface area
+that has to stay in sync if the ledger schema ever changes.
+
+`eventVersion` is part of this event's public contract, not an
+implementation detail, and is `1` for every event this phase produces. A
+future change that alters the meaning of an existing field, removes a
+field, or otherwise breaks a consumer parsing this schema **must**
+introduce `eventVersion 2` rather than silently repurposing an existing
+field's meaning; if the change is wire-incompatible, it should also get a
+new topic (`ledger.journal-entry.posted.v2`, see below) so existing `.v1`
+consumers are never broken out from under them. Purely additive,
+backward-compatible fields may be added without a version bump, since
+JSON consumers are expected to tolerate and ignore unknown fields.
+
+### Topic naming
+
+`ledger.journal-entry.posted.v1` (`LedgerKafkaTopics.JOURNAL_ENTRY_POSTED`)
+follows a `<domain>.<entity>.<event-type>.<version>` convention. The
+version suffix in the topic name is coarser than, and complements rather
+than replaces, `eventVersion` in the payload: a wire-*incompatible*
+schema change gets an entirely new topic (`.v2`), while additive,
+backward-compatible changes stay on `.v1` and are distinguished (if
+needed) by the payload's own `eventVersion` field.
+
+### Message key
+
+The Kafka message key is `journalEntryId.toString()`. Two reasons:
+
+- **Partition ordering for a given entry.** Keying by `journalEntryId`
+  guarantees every message concerning a given `JournalEntry` — this
+  "posted" event today, and any future correction/reversal/amendment
+  event for the same entry in a later phase — lands on the same
+  partition, and Kafka only guarantees ordering *within* a partition.
+  Consumers can therefore rely on messages about the same journal entry
+  arriving in the order they were produced, even though this phase only
+  ever produces one such message per entry.
+- **Even load distribution.** `journalEntryId` is a randomly-generated
+  UUID, so keys — and therefore partition load — are spread evenly.
+  Keying on something coarser and lower-cardinality instead, like an
+  account id, would concentrate a high-activity account's events onto a
+  single partition and could throttle its effective throughput relative
+  to per-entry keying.
+
+### Producer configuration
+
+`LedgerKafkaProducerConfig` defines a dedicated
+`ProducerFactory<String, JournalEntryPostedMessage>` /
+`KafkaTemplate<String, JournalEntryPostedMessage>` bean pair, not the
+Spring Boot auto-configured `KafkaTemplate<Object, Object>` that
+`spring.kafka.producer.*` in `application.yml` describes (that bean is
+Phase 0 scaffold and remains present, but unused by ledger event
+publishing). Every setting is explicit:
+
+| Setting | Value | Why |
+|---|---|---|
+| `BOOTSTRAP_SERVERS_CONFIG` | `${spring.kafka.bootstrap-servers}` | Same property (and `KAFKA_BOOTSTRAP_SERVERS` env var) already wired for the rest of the app — one place to configure the cluster address. |
+| `CLIENT_ID_CONFIG` | `double-entry-ledger-events-producer` | A distinct, descriptive client id so this producer is identifiable in broker-side logs/metrics/quotas, separate from any future producer or consumer. |
+| `KEY_SERIALIZER_CLASS_CONFIG` | `StringSerializer` | The key is a plain string (`journalEntryId.toString()`); no richer serializer is needed. |
+| `VALUE_SERIALIZER_CLASS_CONFIG` | `JsonSerializer` (Spring Kafka) | The payload is a structured object read by consumers outside this JVM; JSON is broadly interoperable and evolves compatibly. |
+| `ACKS_CONFIG` | `all` | Waits for acknowledgment from every in-sync replica, not just the partition leader — the strongest durability guarantee Kafka offers, appropriate for a financial-domain event stream. (This environment's docker-compose Kafka has replication factor 1, so `acks=all` behaves like `acks=1` locally — the setting is what a real, replicated production cluster needs.) |
+| `RETRIES_CONFIG` | `3` | A small number of client-level retries absorbs transient network blips or leader elections without any custom retry code. |
+| `ENABLE_IDEMPOTENCE_CONFIG` | `true` | Pairs with retries: guarantees a retried send can't be written to the partition twice, so producer-level retries can never themselves cause a duplicate event on the broker. |
+| `JsonSerializer.ADD_TYPE_INFO_HEADERS` | `false` | Spring's `JsonSerializer` otherwise stamps a `__TypeId__` header naming this JVM's Java class; external, non-Java consumers should depend only on the JSON body and `eventVersion`, not that implementation detail. |
+
+### Failure handling
+
+`LedgerEventPublisher` records publish failures with structured logging
+that includes `journalEntryId`, `topic`, `exception`, and a `timestamp`
+(see `logPublishFailure`), at `ERROR` level, with the full stack trace
+attached via SLF4J's trailing-`Throwable` convention.
+
+Nothing more robust than logging was built, deliberately. This is a
+portfolio project without existing dead-letter/replay infrastructure, and
+the two failure modes that would justify more are already handled by
+cheaper mechanisms: transient network blips are absorbed by the
+producer's own `retries`/`enable.idempotence` configuration above, and a
+genuinely down broker would fail every publish attempt identically, so an
+application-level retry loop would just delay the same log message rather
+than change the outcome. Specifically **not built**: a scheduled
+redelivery job, a dead-letter table, or an outer retry-with-backoff
+wrapper around `kafkaTemplate.send()` — each would add real complexity
+(persistence for pending events, a relay process, backoff/jitter tuning)
+to guard against a failure mode (sustained broker unavailability) that,
+for this project's actual reliability requirements, is adequately
+answered by "log it, and the outbox migration path below if that ever
+changes."
+
+### Why not the Outbox Pattern (and how to get there later)
+
+The **Outbox Pattern** solves the "dual write" problem: when a service
+needs to both update its own database *and* notify another system (here,
+Kafka) about the same business event, doing those as two independent
+writes means there's no atomicity between them — the DB write can
+succeed while the Kafka publish fails (or vice versa), with no single
+transaction covering both. The Outbox Pattern closes that gap by writing
+the event as a row in an `outbox` table, in the *same* database
+transaction as the business data it describes (here, that would mean the
+`JournalEntry`/`LedgerEntry`/`IdempotencyKey` inserts and an `outbox` row
+insert all committing together, atomically, as one unit). A separate
+relay process — either polling the outbox table or reading the
+database's write-ahead log via CDC (e.g. Debezium) — then reads
+committed outbox rows and publishes them to Kafka, retrying indefinitely
+and marking rows as sent once Kafka confirms receipt. Because the outbox
+row's existence is itself transactionally tied to the business data, an
+event can never be "lost" the way an in-memory, post-commit publish
+attempt theoretically could be if the app crashed between commit and
+publish — production payment systems favor this pattern specifically for
+that durability guarantee.
+
+**This project intentionally uses `AFTER_COMMIT` publishing instead**, for
+reasons specific to what this phase actually needs: it's dramatically
+simpler to implement and reason about (no outbox table, no relay
+process, no polling/CDC infrastructure to run and operate), and the
+`@TransactionalEventListener(AFTER_COMMIT)` + producer-retries +
+structured-logging combination above already fully satisfies this
+phase's three correctness requirements — event-iff-committed, no failed
+post from a publish failure, no duplicate on replay. The one gap
+`AFTER_COMMIT` publishing has relative to an outbox — an event can be
+silently lost if the JVM crashes in the narrow window between the
+transaction committing and `LedgerEventPublisher` finishing its send — is
+a real but narrow risk that isn't worth the added operational complexity
+for a portfolio project with no downstream consumer yet to actually
+depend on zero missed events.
+
+**Migration path, if reliability requirements increase later**: introduce
+an `outbox_events` table (`id`, `aggregate_id` = `journalEntryId`,
+`event_type`, `payload` JSON, `created_at`, `published_at` nullable);
+change `PostingService.postWithinTransaction` to insert a row into it
+(via a repository call, still inside the same `@Transactional` method)
+instead of — or in addition to, during a transition period — calling
+`eventPublisher.publishEvent(...)`; and replace `LedgerEventPublisher`'s
+`@TransactionalEventListener` with a scheduled poller (or a Debezium
+connector reading the table's WAL changes) that reads unpublished outbox
+rows, sends them to Kafka, and marks `published_at` on confirmed send —
+retrying indefinitely on failure instead of just logging. The domain
+event / Kafka event split already in place (`JournalEntryPostedEvent` vs.
+`JournalEntryPostedMessage`) means `PostingService` would need no further
+changes beyond the outbox insert — it already doesn't know or care how
+"a journal entry was posted" gets turned into a Kafka message.
+
+### Testing approach: `@EmbeddedKafka`, not Testcontainers
+
+Testcontainers was evaluated and re-confirmed unusable in this
+environment while building this phase: a throwaway
+`KafkaContainer`-based smoke test was written and run, and it failed with
+the same `BadRequestException` (Docker API negotiation) already
+documented in `LedgerApplicationTests` for Postgres/Kafka Testcontainers
+— this Docker Desktop installation still negotiates API v1.55, which
+Testcontainers 1.20.3's bundled `docker-java` still rejects. That
+throwaway test was deleted after confirming the failure; it was never
+part of the committed test suite.
+
+Rather than fall back to the shared, long-lived docker-compose Kafka
+container the way Postgres integration tests do (the workaround adopted
+in earlier phases, since no embedded-Postgres alternative is available),
+Kafka event-publishing tests use **`@EmbeddedKafka`**, Spring Kafka's
+in-process test broker. `spring-kafka-test` has been a declared
+test-scope dependency since Phase 0 but was unused until this phase.
+`@EmbeddedKafka` was chosen over continuing the docker-compose-container
+pattern because, unlike with Postgres, a viable Docker-independent
+alternative already existed in the dependency tree: it runs fully
+in-process (no Docker involved at all, sidestepping the API-version
+question entirely rather than depending on its outcome), starts fresh
+per test class rather than sharing state with a long-lived container, and
+needs no `docker compose up` to be running for `mvn test` to pass.
+
+`LedgerEventPublisherTest` (`com.abel.ledger.kafka`) is a plain Mockito
+unit test against `LedgerEventPublisher` with a mocked `KafkaTemplate` —
+no broker at all — verifying the correct topic/key/message are sent, and
+that a synchronous throw or an exceptionally-completed future from
+`kafkaTemplate.send()` never propagates.
+
+`LedgerEventPublishingIntegrationTest` (`@SpringBootTest` +
+`@EmbeddedKafka`, real `PostingService` and a real `Consumer` polling the
+embedded broker) covers the three correctness requirements end to end:
+
+- `publishesEventAfterSuccessfulPost` — a successful post produces
+  exactly one Kafka record, keyed by `journalEntryId`, whose JSON body
+  matches the posted `JournalEntry`.
+- `publishesNoEventWhenPostingFailsBecauseEntriesAreUnbalanced` /
+  `publishesNoEventWhenPostingFailsBecauseOfCurrencyMismatch` — a
+  rolled-back posting attempt produces zero records within a bounded
+  poll window. This is the direct proof that the after-commit listener
+  never fires for a transaction that didn't commit.
+- `publishesExactlyOneEventAcrossAnIdempotentReplay` — posting the same
+  request twice (same `idempotencyKey`, same payload) produces exactly
+  one Kafka record, not two.
+
 ## Roadmap
 
 - **Phase 0** (done): runnable scaffold, health endpoint, infra wiring.
@@ -618,11 +987,20 @@ with all ledger invariants holding afterward.
 - **Phase 3** (done): versioned REST API (`/api/v1`) over the existing
   posting/balance/query engine, centralized exception-to-HTTP mapping,
   OpenAPI/Swagger documentation, paginated ledger history.
-- **Phase 4** (this phase): proved posting/balance-reading correctness
+- **Phase 4** (done): proved posting/balance-reading correctness
   under real concurrent access; closed the one real race (concurrent
   `idempotencyKey` reuse) with a catch-and-replay recovery on top of the
   pre-existing unique constraint; documented why no elevated isolation or
   explicit locking is needed for this append-only, no-stored-balance
   schema; added `PostingServiceConcurrencyTest` and the manual
   `PostingServiceStressCheck`.
-- **Later phases**: Kafka event publishing on successful posts.
+- **Phase 5** (this phase): publish a `ledger.journal-entry.posted.v1`
+  Kafka event whenever a `JournalEntry` commits, via a domain event
+  (`JournalEntryPostedEvent`) raised by `PostingService` and converted to
+  a Kafka message by a separate `@TransactionalEventListener(AFTER_COMMIT)`
+  (`LedgerEventPublisher`); no consumer yet, publishing only. Documented
+  the Outbox Pattern as the future migration path if reliability
+  requirements increase.
+- **Later phases** (not yet requested): production readiness work —
+  the core ledger implementation (domain model, posting engine, REST API,
+  concurrency correctness, event publishing) is now complete.

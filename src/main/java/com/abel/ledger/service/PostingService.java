@@ -9,6 +9,7 @@ import com.abel.ledger.dto.LedgerEntryRequest;
 import com.abel.ledger.dto.LedgerEntryResult;
 import com.abel.ledger.dto.PostingRequest;
 import com.abel.ledger.dto.PostingResult;
+import com.abel.ledger.event.JournalEntryPostedEvent;
 import com.abel.ledger.exception.AccountNotFoundException;
 import com.abel.ledger.exception.CurrencyMismatchException;
 import com.abel.ledger.exception.IdempotencyKeyConflictException;
@@ -22,6 +23,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -33,6 +35,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -68,6 +71,17 @@ import org.springframework.util.StringUtils;
  * request's key now exists — not by matching a specific constraint name —
  * and, if so, replays the winner's result instead of surfacing a 500 to a
  * client that did nothing wrong.
+ *
+ * <p>{@code postWithinTransaction} also raises a {@link JournalEntryPostedEvent}
+ * as its last step, immediately after the {@code IdempotencyKey} is saved —
+ * never on the {@code replay()} path, so a sequential idempotent replay or
+ * a recovered concurrency-race loser never raises one. This class has no
+ * dependency on Kafka or any other messaging technology: it publishes
+ * through Spring's {@link ApplicationEventPublisher}, and
+ * {@code com.abel.ledger.kafka.LedgerEventPublisher} is solely responsible
+ * for turning that into a Kafka message, and only after this method's
+ * transaction actually commits. See {@code docs/architecture.md},
+ * "Event Publishing".
  */
 @Service
 public class PostingService {
@@ -76,6 +90,7 @@ public class PostingService {
     private final LedgerEntryRepository ledgerEntryRepository;
     private final AccountRepository accountRepository;
     private final IdempotencyKeyRepository idempotencyKeyRepository;
+    private final ApplicationEventPublisher eventPublisher;
 
     /**
      * Self-reference used to invoke the {@code @Transactional} methods
@@ -91,8 +106,10 @@ public class PostingService {
             JournalEntryRepository journalEntryRepository,
             LedgerEntryRepository ledgerEntryRepository,
             AccountRepository accountRepository,
-            IdempotencyKeyRepository idempotencyKeyRepository) {
-        this(journalEntryRepository, ledgerEntryRepository, accountRepository, idempotencyKeyRepository, null);
+            IdempotencyKeyRepository idempotencyKeyRepository,
+            ApplicationEventPublisher eventPublisher) {
+        this(journalEntryRepository, ledgerEntryRepository, accountRepository, idempotencyKeyRepository,
+                eventPublisher, null);
     }
 
     @Autowired
@@ -101,11 +118,13 @@ public class PostingService {
             LedgerEntryRepository ledgerEntryRepository,
             AccountRepository accountRepository,
             IdempotencyKeyRepository idempotencyKeyRepository,
+            ApplicationEventPublisher eventPublisher,
             @Lazy PostingService self) {
         this.journalEntryRepository = journalEntryRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
         this.accountRepository = accountRepository;
         this.idempotencyKeyRepository = idempotencyKeyRepository;
+        this.eventPublisher = eventPublisher;
         this.self = self != null ? self : this;
     }
 
@@ -152,6 +171,15 @@ public class PostingService {
                         .requestFingerprint(fingerprint)
                         .journalEntryId(journalEntry.getId())
                         .build());
+
+        // journalEntry.getCreatedAt() is deliberately not used for postedAt:
+        // it's populated by @CreationTimestamp only on flush, which hasn't
+        // happened yet at this point in the method (see the Phase 3 "known
+        // tradeoff" note in docs/architecture.md) — Instant.now() here is
+        // both correct (this is genuinely when the posting happened) and
+        // avoids that timing gotcha entirely.
+        eventPublisher.publishEvent(new JournalEntryPostedEvent(
+                journalEntry.getId(), journalEntry.getReferenceId(), Instant.now(), Set.copyOf(accountsById.keySet())));
 
         return toResult(journalEntry, savedEntries);
     }

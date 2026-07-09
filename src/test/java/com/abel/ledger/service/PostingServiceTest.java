@@ -17,6 +17,7 @@ import com.abel.ledger.domain.ledger.LedgerEntry;
 import com.abel.ledger.dto.LedgerEntryRequest;
 import com.abel.ledger.dto.PostingRequest;
 import com.abel.ledger.dto.PostingResult;
+import com.abel.ledger.event.JournalEntryPostedEvent;
 import com.abel.ledger.exception.AccountNotFoundException;
 import com.abel.ledger.exception.CurrencyMismatchException;
 import com.abel.ledger.exception.IdempotencyKeyConflictException;
@@ -35,8 +36,10 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.context.ApplicationEventPublisher;
 
 @ExtendWith(MockitoExtension.class)
 class PostingServiceTest {
@@ -53,6 +56,9 @@ class PostingServiceTest {
     @Mock
     private IdempotencyKeyRepository idempotencyKeyRepository;
 
+    @Mock
+    private ApplicationEventPublisher eventPublisher;
+
     private PostingService postingService;
 
     private Account cashAccount;
@@ -61,7 +67,8 @@ class PostingServiceTest {
     @BeforeEach
     void setUp() {
         postingService = new PostingService(
-                journalEntryRepository, ledgerEntryRepository, accountRepository, idempotencyKeyRepository);
+                journalEntryRepository, ledgerEntryRepository, accountRepository, idempotencyKeyRepository,
+                eventPublisher);
 
         cashAccount = Account.builder()
                 .id(UUID.randomUUID())
@@ -106,6 +113,7 @@ class PostingServiceTest {
 
         verifyNoInteractions(journalEntryRepository);
         verify(ledgerEntryRepository, never()).saveAll(anyList());
+        verifyNoInteractions(eventPublisher);
     }
 
     @Test
@@ -124,6 +132,7 @@ class PostingServiceTest {
                 .isInstanceOf(CurrencyMismatchException.class);
 
         verifyNoInteractions(journalEntryRepository);
+        verifyNoInteractions(eventPublisher);
     }
 
     @Test
@@ -211,6 +220,13 @@ class PostingServiceTest {
         assertThat(result.referenceId()).isEqualTo("ref-1");
         assertThat(result.entries()).hasSize(2);
         verify(idempotencyKeyRepository).save(any(IdempotencyKey.class));
+
+        ArgumentCaptor<JournalEntryPostedEvent> eventCaptor = ArgumentCaptor.forClass(JournalEntryPostedEvent.class);
+        verify(eventPublisher).publishEvent(eventCaptor.capture());
+        JournalEntryPostedEvent event = eventCaptor.getValue();
+        assertThat(event.journalEntryId()).isEqualTo(result.journalEntryId());
+        assertThat(event.referenceId()).isEqualTo("ref-1");
+        assertThat(event.affectedAccountIds()).containsExactlyInAnyOrder(cashAccount.getId(), revenueAccount.getId());
     }
 
     @Test
@@ -266,6 +282,7 @@ class PostingServiceTest {
         verify(journalEntryRepository, never()).save(any());
         verify(ledgerEntryRepository, never()).saveAll(anyList());
         verify(idempotencyKeyRepository, never()).save(any());
+        verifyNoInteractions(eventPublisher);
     }
 
     @Test
