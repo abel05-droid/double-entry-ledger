@@ -42,6 +42,8 @@ src/main/java/com/abel/ledger/
     journal/                    JournalEntry entity
     ledger/                     LedgerEntry entity, EntryType enum
     idempotency/                IdempotencyKey entity
+    user/                       User entity, Role enum (ADMIN/VIEWER) —
+                                 see "Authentication and Authorization"
   dto/                          SERVICE-layer DTOs (PostingRequest,
                                  LedgerEntryRequest, PostingResult,
                                  LedgerEntryResult, AccountBalance) —
@@ -57,7 +59,8 @@ src/main/java/com/abel/ledger/
     JournalEntryPostedEvent.java   plain-Java domain event, no Kafka
                                     dependency — see "Event Publishing" below
   repository/                   Spring Data JPA repositories, one per
-                                 aggregate (flat, not nested under domain/)
+                                 aggregate (flat, not nested under domain/),
+                                 including UserRepository
   service/
     PostingService.java         validates and atomically posts transactions;
                                  raises JournalEntryPostedEvent on success
@@ -88,13 +91,27 @@ src/main/java/com/abel/ledger/
     BalanceObservabilityAspect.java @Around advice on
                                     BalanceService.getBalance
     KafkaHealthIndicator.java      custom /actuator/health "kafka" component
+  security/                      stateless JWT auth + role authorization —
+                                  see "Authentication and Authorization"
+    SecurityConfig.java             SecurityFilterChain, PasswordEncoder,
+                                     AuthenticationManager beans
+    JwtService.java                 issues/verifies HS256 JWTs
+    JwtProperties.java               jwt.secret / jwt.expiration binding
+    JwtAuthenticationFilter.java    populates SecurityContext from a
+                                     Bearer token, or leaves it anonymous
+    CustomUserDetailsService.java   UserDetailsService backed by UserRepository
+    RestAuthenticationEntryPoint.java  401 for missing/invalid/expired tokens
+    RestAccessDeniedHandler.java       403 for insufficient role
   api/                          the REST layer — see "API layer structure" below
     controller/
       JournalEntryController.java
       AccountController.java
+      AuthController.java         POST /api/v1/auth/login
     dto/
-      request/                  API-layer request DTOs (Jakarta Validation)
-      response/                 API-layer response DTOs, incl. PagedResponse<T>
+      request/                  API-layer request DTOs (Jakarta Validation),
+                                 incl. LoginRequest
+      response/                 API-layer response DTOs, incl.
+                                 PagedResponse<T> and LoginResponse
     mapper/
       LedgerApiMapper.java      API DTO <-> service DTO translation
     exception/
@@ -104,7 +121,8 @@ src/main/resources/
   application-dev.yml           local development overrides
   logback-spring.xml            plain-text (default) vs. JSON (json-logs
                                  profile) log output — see "Observability"
-  db/migration/                 Flyway migrations
+  db/migration/                 Flyway migrations (V4 adds users, seeded
+                                 with the ADMIN/VIEWER demo accounts)
 src/test/java/com/abel/ledger/
   LedgerApplicationTests.java   context load + smoke tests
   service/
@@ -141,10 +159,20 @@ src/test/java/com/abel/ledger/
   api/controller/
     JournalEntryControllerIntegrationTest.java   MockMvc, real HTTP request/response
     AccountControllerIntegrationTest.java        MockMvc, real HTTP request/response
+  security/
+    SecurityIntegrationTest.java   MockMvc — login, malformed/expired/missing
+                                    JWT, role-based 401 vs. 403, public paths
 docs/
   architecture.md               this file
   posting-flow.md               ordered walkthrough of the posting flow
   api-examples.md               curl/HTTPie + JSON examples per endpoint
+  load-testing.md               hey-based load test, usage + measured results
+.github/workflows/
+  ci.yml                        test (real Postgres/Kafka) + dependency-check
+                                 + Docker build/Trivy-scan jobs — see
+                                 "Production Readiness"
+scripts/
+  load-test.sh                  see docs/load-testing.md
 ```
 
 ## API layer structure
@@ -223,7 +251,7 @@ that location either way.
 
 ## Database schema
 
-Four tables, managed by Flyway migrations in
+Five tables, managed by Flyway migrations in
 `src/main/resources/db/migration/`:
 
 - **V1__init.sql** — enables the `pgcrypto` extension (used for
@@ -1551,6 +1579,74 @@ appear both inside the rendered `message` text (harmless — the
 as independent, queryable top-level fields — the dual-rendering behavior
 described in "Structured logging" above.
 
+## Production Readiness
+
+What Phases 6-8 actually built toward running this in front of real
+traffic, and — just as important for a portfolio piece to be honest
+about — what's still missing before it should.
+
+### What's built
+
+- **Observability** (Phase 6): structured logs (plain text locally, JSON
+  in production via the `json-logs` profile), a correlation id threaded
+  through every log line and returned to the caller, `ledger.*` business
+  metrics plus Boot's standard HTTP/JVM/datasource metrics on
+  `/actuator/prometheus`, and health checks that distinguish database
+  from Kafka availability.
+- **Security** (Phase 7): stateless JWT authentication, two-role
+  authorization enforced at the security-filter layer, BCrypt password
+  storage, no plaintext credentials or tokens in any log line.
+- **CI/CD** (Phase 8): every push and pull request to `main` runs the
+  full test suite against real Postgres and Kafka (the same
+  docker-compose stack used locally, not a mocked substitute) and an
+  OWASP Dependency-Check vulnerability scan; every push to `main`
+  additionally builds the Docker image and scans it with Trivy, failing
+  on HIGH/CRITICAL findings. See `.github/workflows/ci.yml`.
+- **Container image** (Phase 8): multi-stage build with a JRE-only (no
+  build tooling) runtime image, a non-root user, a `HEALTHCHECK` against
+  `/actuator/health`, and OCI metadata labels.
+- **Load testing** (Phase 8): a repeatable `hey`-based script and
+  documented, actually-measured throughput/latency numbers — see
+  `docs/load-testing.md` — distinct from Phase 4's
+  `PostingServiceConcurrencyTest`, which proves correctness under
+  concurrency rather than measuring performance.
+
+### What's deliberately still out of scope
+
+This is a portfolio project demonstrating specific engineering
+decisions, not a system being handed a production traffic allocation.
+Left out on purpose, not by oversight:
+
+- **Secrets management.** `jwt.secret` and database credentials are
+  environment variables with local-dev defaults (see
+  `application.yml`); nothing here integrates a real secrets manager
+  (Vault, AWS Secrets Manager, etc.). A real deployment would need one —
+  environment variables on a shared host or in a process listing are not
+  an acceptable place for a JWT signing key or a database password.
+- **Database backup and recovery.** No backup schedule, point-in-time
+  recovery, or tested restore procedure exists for the Postgres data.
+  For a system whose entire value proposition is an accurate,
+  never-lose-a-transaction ledger, this would be one of the first things
+  a real deployment needs — and one of the areas where "portfolio scope"
+  and "production scope" diverge the most.
+- **Multi-region / high availability.** Single Postgres instance, single
+  Kafka broker (KRaft mode, one node), no read replicas, no failover.
+  Fine for demonstrating the application's own correctness and
+  concurrency properties; nowhere near what a financial system's
+  availability requirements would actually demand.
+- **Container registry and deployment pipeline.** CI builds and scans
+  the Docker image but never pushes it anywhere — there's no registry
+  configured and no deployment target (Kubernetes manifests, ECS task
+  definitions, etc.). See `.github/workflows/ci.yml`'s comment on why:
+  no registry credentials are wired up for this repository, deliberately.
+- **Rate limiting and abuse protection**, beyond what's already noted in
+  "Authentication and Authorization" (no login rate limiting). No
+  request throttling, no WAF, no DDoS protection at any layer.
+- **Refresh tokens, password reset, per-account permissions.** Already
+  listed in "Authentication and Authorization" above; repeated here only
+  to keep this the single place that answers "is this production-ready,"
+  honestly.
+
 ## Roadmap
 
 - **Phase 0** (done): runnable scaffold, health endpoint, infra wiring.
@@ -1574,7 +1670,7 @@ described in "Structured logging" above.
   (`LedgerEventPublisher`); no consumer yet, publishing only. Documented
   the Outbox Pattern as the future migration path if reliability
   requirements increase.
-- **Phase 6** (this phase): structured logging (plain text by default,
+- **Phase 6** (done): structured logging (plain text by default,
   JSON via the `json-logs` profile, both from the same log statements),
   a `CorrelationIdFilter` propagating `X-Correlation-ID` through MDC,
   `ledger.*` business metrics alongside Boot's automatic HTTP/JVM/
@@ -1582,7 +1678,7 @@ described in "Structured logging" above.
   indicator distinguishing database and Kafka availability — all added
   via AOP or purely-additive edits, with zero behavioral changes to
   `PostingService`/`BalanceService`/`LedgerEventPublisher`.
-- **Phase 7** (this phase): stateless JWT authentication
+- **Phase 7** (done): stateless JWT authentication
   (`POST /api/v1/auth/login`, HS256, `sub`/`role`/`iat`/`exp` claims) and
   two-role (`ADMIN`/`VIEWER`) authorization via a Spring Boot 3
   `SecurityFilterChain` — posting journal entries requires `ADMIN`,
@@ -1590,5 +1686,11 @@ described in "Structured logging" above.
   at the security-filter layer; `PostingService`, `BalanceService`, and
   `LedgerEventPublisher` have no dependency on Spring Security. See
   "Authentication and Authorization" above.
-- **Later phases** (not yet requested): Phase 8 (production hardening) —
-  do not begin without explicit request.
+- **Phase 8** (this phase, final): GitHub Actions CI/CD (test job against
+  real Postgres/Kafka via docker-compose, OWASP Dependency-Check, a Docker
+  build-and-Trivy-scan job), an optimized multi-stage Dockerfile
+  (BuildKit cache mounts, non-root user, `HEALTHCHECK`, OCI labels), a
+  `hey`-based load test measuring throughput/latency (distinct from Phase
+  4's correctness-under-concurrency work), and documentation polish. See
+  "Production Readiness" below. This is the last planned phase for this
+  project.

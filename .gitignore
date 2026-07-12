@@ -17,3 +17,6 @@ target/
 
 # Env
 .env
+
+# Load test scratch output (regenerate via scripts/load-test.sh)
+load-test-results/

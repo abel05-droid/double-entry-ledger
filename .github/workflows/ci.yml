@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # Reuses the same docker-compose.yml (and its healthchecks) that
+      # local development and manual verification already depend on,
+      # rather than redefining Postgres/Kafka a second time as GitHub
+      # Actions "services:" containers — one source of truth for how this
+      # project's infra is configured.
+      - name: Start Postgres and Kafka
+        run: docker compose up -d --wait postgres kafka
+
+      - name: Run tests and build
+        run: ./mvnw -B verify
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 14
+
+      - name: Tear down infra
+        if: always()
+        run: docker compose down -v
+
+  dependency-check:
+    name: Dependency vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Runs standalone (no setup-java step) deliberately: this action's
+      # own container image ships the JDK it needs, and combining it with
+      # actions/setup-java is a documented source of JAVA_HOME conflicts
+      # (https://github.com/dependency-check/Dependency-Check_Action) that
+      # this job has no reason to risk since it only needs to read
+      # pom.xml, not compile anything.
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@1.1.0
+        with:
+          project: double-entry-ledger
+          path: '.'
+          format: HTML
+          out: reports
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+
+      - name: Upload dependency-check report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dependency-check-report
+          path: reports/
+          retention-days: 14
+
+  docker:
+    name: Build and scan Docker image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Built and loaded into the local Docker daemon for scanning below,
+      # never pushed to a registry — this portfolio project has no
+      # registry credentials to push with, and none are configured here
+      # on purpose (see docs/architecture.md, "Production Readiness").
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: double-entry-ledger:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Pinned to a commit SHA rather than a version tag: in early 2026,
+      # aquasecurity/trivy-action had the vast majority of its version
+      # tags force-pushed to serve a malicious payload. A SHA pin can't be
+      # silently repointed the way a tag can.
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: double-entry-ledger:ci
+          format: json
+          output: trivy-report.json
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          retention-days: 14
