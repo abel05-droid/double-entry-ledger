@@ -5,7 +5,7 @@ bookkeeping infrastructure used by banks and payment processors. Balances are
 never stored; they are always derived from an append-only stream of ledger
 entries.
 
-> **Status:** Phase 0 — project scaffold. No ledger domain logic yet.
+> **Status:** Phase 7 — JWT authentication and role-based authorization.
 
 ## Tech Stack
 
@@ -18,6 +18,7 @@ entries.
 - Docker Compose
 - Lombok
 - Spring Data JPA, Spring Web, Spring Validation, Spring Boot Actuator
+- Spring Security, JJWT (JWT signing/verification)
 - JUnit 5 + Testcontainers
 
 ## Prerequisites
@@ -53,6 +54,30 @@ curl http://localhost:8080/
 curl http://localhost:8080/actuator/health
 # {"status":"UP"}
 ```
+
+## Authenticating
+
+Posting journal entries and creating accounts require an `ADMIN` bearer
+token; reading balances and ledger history requires any authenticated
+user (`ADMIN` or `VIEWER`). Get a token from `POST /api/v1/auth/login`:
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin123"}' | jq -r .token
+```
+
+**Demo credentials** (seeded by a Flyway migration — not for real use):
+
+| Username | Password    | Role   |
+|----------|-------------|--------|
+| `admin`  | `admin123`  | ADMIN  |
+| `viewer` | `viewer123` | VIEWER |
+
+Attach the returned token as `Authorization: Bearer <token>` on
+subsequent requests. See `docs/api-examples.md` for a full worked example
+and `docs/architecture.md`'s "Authentication and Authorization" section
+for the JWT/role design.
 
 ## Running everything via Docker Compose
 

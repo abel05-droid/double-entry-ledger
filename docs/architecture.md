@@ -244,6 +244,11 @@ Four tables, managed by Flyway migrations in
   - `idempotency_keys` (`id`, `idempotency_key` unique, `request_fingerprint`
     — a SHA-256 hex digest of the request payload, `journal_entry_id` FK,
     `created_at`)
+- **V4__create_users.sql**
+  - `users` (`id`, `username` unique, `password_hash` — BCrypt, never
+    plaintext, `role` CHECK'd to `ADMIN`/`VIEWER`, `created_at`) — seeds
+    one `ADMIN` and one `VIEWER` demo user; see "Authentication and
+    Authorization" below and the README for the credentials
 
 Entry currency is validated against its account's currency in the service
 layer (`PostingService`), not the schema — PostgreSQL has no clean way to
@@ -1320,6 +1325,168 @@ reserved port nothing listens on — DOWN, with an `error` detail),
 without needing to actually stop the shared docker-compose Kafka
 container the rest of the suite depends on.
 
+## Authentication and Authorization
+
+Phase 7's job was to require an authenticated, sufficiently-privileged
+caller for the two write-shaped operations (posting a journal entry;
+account creation, if a create-account endpoint is ever added) while
+keeping every read endpoint open to any authenticated caller — without
+touching `PostingService`, `BalanceService`, `LedgerEventPublisher`, or
+any controller's business logic. Every file this phase added or touched
+lives in `com.abel.ledger.security`, `com.abel.ledger.domain.user`, a new
+`AuthController`, and the `SecurityFilterChain`'s `authorizeHttpRequests`
+rules — nothing in the posting/balance/event-publishing path changed.
+
+### JWT design
+
+- **Claims**: `sub` (username), `role` (`ADMIN` or `VIEWER`), `iat`, `exp`.
+  Nothing else — no permissions list, no account-scoped grants. A request's
+  authorization decision only ever needs to know who the caller is and
+  which of the two roles they hold.
+- **Algorithm**: HS256 (symmetric), via `jjwt` (`jjwt-api`/`jjwt-impl`/`jjwt-jackson`).
+  A single shared secret (`jwt.secret`) signs and verifies every token;
+  there's exactly one service issuing and consuming its own tokens, so
+  there's no case for asymmetric signing (RS256) here.
+- **Key derivation**: the signing key is `SHA-256(jwt.secret)`, not
+  `jwt.secret`'s raw bytes. HS256 requires a key of at least 256 bits;
+  the default `change-me-for-local-dev` (and most human-typed secrets)
+  is shorter than that, so using it directly would make key construction
+  fail at startup. Hashing always yields exactly 32 bytes regardless of
+  the configured secret's length while still deriving deterministically
+  from it — two instances configured with the same `jwt.secret` verify
+  each other's tokens. See `JwtService`'s javadoc for the exact reasoning.
+- **Expiry**: `jwt.expiration` (`PT1H` by default, an ISO-8601 duration
+  bound directly to `java.time.Duration` by Spring Boot's relaxed
+  binding). A `JwtAuthenticationFilter` on every request either
+  authenticates the caller from a still-valid token's claims, or — for a
+  missing, malformed, wrong-signature, or expired token — leaves the
+  request unauthenticated and lets `authorizeHttpRequests` decide what
+  happens next (see "Authorization enforcement" below). No refresh flow
+  exists yet; see "Deliberately not built" below.
+- **Transport**: `Authorization: Bearer <token>` only. No cookies —
+  nothing here needs cookie-based session semantics, and using a header
+  keeps CSRF entirely out of scope (see "Statelessness" below).
+
+### Role model
+
+Two roles, no more:
+
+- **ADMIN** — everything VIEWER can do, plus `POST /api/v1/journal-entries`
+  (and any future account-creation endpoint).
+- **VIEWER** — read-only: `GET /api/v1/accounts/{id}/balance`,
+  `GET /api/v1/accounts/{id}/ledger`, `GET /api/v1/journal-entries/{id}`.
+
+There is no per-account or per-transaction-type permission — a VIEWER can
+read every account's balance and ledger, not just some. That's a
+deliberate simplification (see "Deliberately not built" below), not an
+oversight.
+
+### Authorization enforcement
+
+All of it lives in `SecurityConfig#securityFilterChain`'s
+`authorizeHttpRequests` block — a single, readable list of URL/method
+rules, not scattered `@PreAuthorize` annotations across controllers:
+
+- `/`, `/api/v1/auth/login`, `/actuator/health`, `/swagger-ui.html`,
+  `/swagger-ui/**`, `/v3/api-docs`, `/v3/api-docs/**` — public.
+- `POST /api/v1/journal-entries`, `POST /api/v1/accounts/**` — `ADMIN` only.
+  (`/api/v1/accounts/**` is included pre-emptively: no account-creation
+  endpoint exists yet — `AccountController` is read-only today — but the
+  rule is already in place so one can be added later without a second
+  security review.)
+- Everything else (every other endpoint that exists today: the balance,
+  ledger, and single-journal-entry GETs) — any authenticated user,
+  `ADMIN` or `VIEWER`.
+
+`JwtAuthenticationFilter` (registered via `.addFilterBefore(...,
+UsernamePasswordAuthenticationFilter.class)`) is the only place a token
+is parsed. On a valid token it populates `SecurityContextHolder` with the
+username and a `ROLE_<role>` authority taken straight from the token's
+claims — no per-request database lookup. On any parse/verify failure it
+does nothing and lets the request continue as anonymous; whether that
+matters is entirely up to `authorizeHttpRequests` and the two handlers
+below.
+
+**401 vs. 403, and why they're distinct classes.** `RestAuthenticationEntryPoint`
+handles "not authenticated at all" (missing header, malformed token,
+wrong signature, expired token — `JwtAuthenticationFilter` collapses all
+of these into "anonymous," so they all land here) and writes 401 in the
+same `ErrorResponse` shape the rest of the API uses.
+`RestAccessDeniedHandler` handles "authenticated, but the wrong role" —
+a VIEWER token hitting `POST /api/v1/journal-entries` — and writes 403.
+Reusing `GlobalExceptionHandler`'s `ErrorResponse` record (rather than
+Spring Security's default HTML/plain-text error output) keeps every
+error response in this API — business, validation, or auth — the same
+shape.
+
+### Password storage and login
+
+`User` (`domain/user`) stores only a BCrypt `passwordHash`, never a
+plaintext password, via a singleton `BCryptPasswordEncoder` bean used
+everywhere a password is checked or stored. `CustomUserDetailsService`
+loads a `User` by username and adapts it to Spring Security's
+`UserDetailsService` contract; `POST /api/v1/auth/login` (`AuthController`)
+hands the submitted credentials to the standard `AuthenticationManager` /
+`DaoAuthenticationProvider` pipeline rather than comparing hashes by
+hand, so unknown-username and wrong-password both fail the same way
+(`AuthenticationException` → 401) without revealing which case occurred.
+
+### Statelessness
+
+`SessionCreationPolicy.STATELESS` and CSRF disabled. There's no session
+to fixate or hijack, and no cookie for a CSRF token to protect — the only
+credential a client presents is a bearer token it must explicitly attach
+itself, which is exactly the CSRF mitigation a token-in-header scheme
+provides by construction.
+
+### `@EnableWebSecurity` is explicit, not implicit
+
+`SecurityConfig` declares `@EnableWebSecurity` directly rather than
+relying on Spring Boot's own auto-configuration
+(`WebSecurityEnablerConfiguration`), because that auto-import is gated
+behind `@ConditionalOnWebApplication(type = SERVLET)`. This project
+already has tests that boot a non-web application context
+(`PostingServiceConcurrencyTest` uses `@SpringBootTest(webEnvironment =
+NONE)`) — component scanning still finds and instantiates every
+`@RestController` there, including the new `AuthController`, which needs
+an `AuthenticationManager` bean regardless of whether a servlet container
+exists. Declaring `@EnableWebSecurity` explicitly makes that bean (and
+`HttpSecurity`) available in any context type, not just a servlet one.
+
+### Correlation id filter interaction
+
+`CorrelationIdFilter` needed no changes. It's registered as a plain
+servlet filter at `@Order(Ordered.HIGHEST_PRECEDENCE)`
+(`Integer.MIN_VALUE`), which places it ahead of Spring Security's own
+filter chain (Boot registers that at `SecurityProperties.DEFAULT_FILTER_ORDER`,
+`-100`) regardless of how authentication turns out. It runs — and
+establishes `correlationId` in MDC and the response header — before
+`JwtAuthenticationFilter` ever executes, for both a request that
+ultimately succeeds and one `RestAuthenticationEntryPoint`/`RestAccessDeniedHandler`
+rejects. No log statement anywhere in the new security code logs a JWT,
+a password, or a password hash — `JwtAuthenticationFilter`'s debug log on
+a rejected token records only the exception's class name.
+
+### Deliberately not built
+
+- **Refresh tokens.** Out of scope for this phase, per its instructions.
+  A 1-hour-expiry access token with no refresh path means a session
+  requires re-authenticating hourly — acceptable for a portfolio
+  demonstration, not for a real deployment.
+- **Password reset.** No self-service or admin-initiated reset flow.
+  The two seeded demo users are the only accounts; there's no forgot
+  password / email verification infrastructure to build a reset flow on
+  top of.
+- **Fine-grained, per-account permissions.** VIEWER can read every
+  account's balance and ledger, not a scoped subset. A real multi-tenant
+  ledger would need per-account or per-customer authorization; that's a
+  materially bigger design problem (how is an account-to-caller mapping
+  established and maintained?) deferred well past this phase's scope.
+- **Rate limiting on login.** `POST /api/v1/auth/login` has no
+  brute-force protection (lockout, exponential backoff, CAPTCHA). A real
+  deployment would want this; a two-user demo credential set doesn't
+  meaningfully benefit from it.
+
 ## How to Monitor This Service
 
 ### Actuator endpoints
@@ -1415,5 +1582,13 @@ described in "Structured logging" above.
   indicator distinguishing database and Kafka availability — all added
   via AOP or purely-additive edits, with zero behavioral changes to
   `PostingService`/`BalanceService`/`LedgerEventPublisher`.
-- **Later phases** (not yet requested): Phase 7 (security), Phase 8
-  (production hardening) — do not begin without explicit request.
+- **Phase 7** (this phase): stateless JWT authentication
+  (`POST /api/v1/auth/login`, HS256, `sub`/`role`/`iat`/`exp` claims) and
+  two-role (`ADMIN`/`VIEWER`) authorization via a Spring Boot 3
+  `SecurityFilterChain` — posting journal entries requires `ADMIN`,
+  every read endpoint requires any authenticated user. Enforced entirely
+  at the security-filter layer; `PostingService`, `BalanceService`, and
+  `LedgerEventPublisher` have no dependency on Spring Security. See
+  "Authentication and Authorization" above.
+- **Later phases** (not yet requested): Phase 8 (production hardening) —
+  do not begin without explicit request.

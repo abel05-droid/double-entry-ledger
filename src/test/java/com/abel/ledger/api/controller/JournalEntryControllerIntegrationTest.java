@@ -10,6 +10,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.abel.ledger.domain.account.Account;
 import com.abel.ledger.domain.account.AccountType;
+import com.abel.ledger.domain.user.Role;
+import com.abel.ledger.security.JwtService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 import java.util.Map;
@@ -18,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -51,6 +54,17 @@ class JournalEntryControllerIntegrationTest {
     @Autowired
     private com.abel.ledger.repository.AccountRepository accountRepository;
 
+    @Autowired
+    private JwtService jwtService;
+
+    private String adminAuthHeader() {
+        return "Bearer " + jwtService.generateToken("test-admin", Role.ADMIN).token();
+    }
+
+    private String viewerAuthHeader() {
+        return "Bearer " + jwtService.generateToken("test-viewer", Role.VIEWER).token();
+    }
+
     private Account saveAccount(AccountType type) {
         return accountRepository.save(Account.builder()
                 .accountNumber("ACC-" + UUID.randomUUID())
@@ -79,6 +93,7 @@ class JournalEntryControllerIntegrationTest {
                 debitAccount.getId(), creditAccount.getId(), "100.00");
 
         MvcResult result = mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isCreated())
@@ -107,12 +122,14 @@ class JournalEntryControllerIntegrationTest {
         String payload = objectMapper.writeValueAsString(body);
 
         MvcResult first = mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON).content(payload))
                 .andExpect(status().isCreated())
                 .andReturn();
         String firstId = objectMapper.readTree(first.getResponse().getContentAsString()).get("id").asText();
 
         MvcResult second = mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON).content(payload))
                 .andExpect(status().isCreated())
                 .andReturn();
@@ -128,6 +145,7 @@ class JournalEntryControllerIntegrationTest {
         String idempotencyKey = "idem-" + UUID.randomUUID();
 
         mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(postingRequestBody(
                                 idempotencyKey, "REF-" + UUID.randomUUID(),
@@ -135,6 +153,7 @@ class JournalEntryControllerIntegrationTest {
                 .andExpect(status().isCreated());
 
         mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(postingRequestBody(
                                 idempotencyKey, "REF-" + UUID.randomUUID(),
@@ -161,6 +180,7 @@ class JournalEntryControllerIntegrationTest {
                         "accountId", creditAccount.getId(), "amount", "90.00", "currency", "USD")));
 
         mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isUnprocessableEntity())
@@ -183,6 +203,7 @@ class JournalEntryControllerIntegrationTest {
                         "accountId", creditAccount.getId(), "amount", "100.00", "currency", "USD")));
 
         mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isUnprocessableEntity())
@@ -197,6 +218,7 @@ class JournalEntryControllerIntegrationTest {
                 "creditEntries", List.of());
 
         mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isBadRequest())
@@ -212,6 +234,7 @@ class JournalEntryControllerIntegrationTest {
                 debitAccount.getId(), creditAccount.getId(), "40.00");
 
         MvcResult posted = mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isCreated())
@@ -219,7 +242,8 @@ class JournalEntryControllerIntegrationTest {
         String journalEntryId = objectMapper.readTree(posted.getResponse().getContentAsString())
                 .get("id").asText();
 
-        mockMvc.perform(get("/api/v1/journal-entries/{id}", journalEntryId))
+        mockMvc.perform(get("/api/v1/journal-entries/{id}", journalEntryId)
+                        .header(HttpHeaders.AUTHORIZATION, viewerAuthHeader()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(journalEntryId))
                 .andExpect(jsonPath("$.entries", org.hamcrest.Matchers.hasSize(2)));
@@ -227,7 +251,8 @@ class JournalEntryControllerIntegrationTest {
 
     @Test
     void getJournalEntry_notFound_returns404() throws Exception {
-        mockMvc.perform(get("/api/v1/journal-entries/{id}", UUID.randomUUID()))
+        mockMvc.perform(get("/api/v1/journal-entries/{id}", UUID.randomUUID())
+                        .header(HttpHeaders.AUTHORIZATION, viewerAuthHeader()))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.status").value(404));
     }

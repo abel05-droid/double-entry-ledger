@@ -7,16 +7,69 @@ Base URL below assumes the app is running locally on the default port
 - `22222222-2222-2222-2222-222222222222` — a `REVENUE` account ("Sales"), `USD`
 
 Full interactive documentation is at `/swagger-ui.html`; the raw OpenAPI
-spec is at `/v3/api-docs`.
+spec is at `/v3/api-docs`. Every endpoint below except `POST
+/api/v1/auth/login`, `/actuator/health`, `/swagger-ui.html`, and
+`/v3/api-docs` requires an `Authorization: Bearer <token>` header — see
+"POST /api/v1/auth/login" first. See the README for the seeded demo
+credentials.
+
+## POST /api/v1/auth/login
+
+Exchanges a username/password for a signed JWT.
+
+**curl**
+
+```bash
+curl -i -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin123"}'
+```
+
+**Response — `200 OK`**
+
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJBRE1JTiIsImlhdCI6MTc4MzM4NDc2NCwiZXhwIjoxNzgzMzg4MzY0fQ.abc123signature",
+  "expiresAt": "2026-07-08T03:12:44.512Z"
+}
+```
+
+**Wrong password or unknown username — `401 Unauthorized`**
+
+```json
+{
+  "timestamp": "2026-07-08T02:12:44.512Z",
+  "status": 401,
+  "error": "Unauthorized",
+  "message": "Invalid username or password",
+  "path": "/api/v1/auth/login"
+}
+```
+
+### Using the token on a protected endpoint
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin123"}' | jq -r .token)
+
+curl -i http://localhost:8080/api/v1/accounts/11111111-1111-1111-1111-111111111111/balance \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+A missing, malformed, or expired token on a protected endpoint returns
+`401` in the same shape as above; a valid token for the wrong role (e.g.
+a `VIEWER` token on `POST /api/v1/journal-entries`) returns `403`.
 
 ## POST /api/v1/journal-entries
 
-Posts a new, balanced journal entry.
+Posts a new, balanced journal entry. Requires an `ADMIN` token.
 
 **curl**
 
 ```bash
 curl -i -X POST http://localhost:8080/api/v1/journal-entries \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "idempotencyKey": "3f29b6b0-3c22-4e7a-9c1a-6e6f6a2b9b11",
@@ -35,6 +88,7 @@ curl -i -X POST http://localhost:8080/api/v1/journal-entries \
 
 ```bash
 http POST :8080/api/v1/journal-entries \
+  "Authorization:Bearer $TOKEN" \
   idempotencyKey=3f29b6b0-3c22-4e7a-9c1a-6e6f6a2b9b11 \
   referenceId=INV-100245 \
   description="Invoice #100245 payment" \

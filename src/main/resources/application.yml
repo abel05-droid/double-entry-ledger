@@ -43,6 +43,10 @@ spring:
 server:
   port: ${SERVER_PORT:8080}
 
+jwt:
+  secret: ${JWT_SECRET:change-me-for-local-dev}
+  expiration: PT1H
+
 management:
   endpoints:
     web:

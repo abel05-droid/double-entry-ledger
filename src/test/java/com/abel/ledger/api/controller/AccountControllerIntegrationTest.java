@@ -8,7 +8,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.abel.ledger.domain.account.Account;
 import com.abel.ledger.domain.account.AccountType;
+import com.abel.ledger.domain.user.Role;
 import com.abel.ledger.repository.AccountRepository;
+import com.abel.ledger.security.JwtService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 import java.util.Map;
@@ -17,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -39,6 +42,9 @@ class AccountControllerIntegrationTest {
     @Autowired
     private AccountRepository accountRepository;
 
+    @Autowired
+    private JwtService jwtService;
+
     private Account saveAccount(AccountType type) {
         return accountRepository.save(Account.builder()
                 .accountNumber("ACC-" + UUID.randomUUID())
@@ -46,6 +52,16 @@ class AccountControllerIntegrationTest {
                 .accountType(type)
                 .currency("USD")
                 .build());
+    }
+
+    // Reads are available to any authenticated role, so these tests
+    // deliberately use a VIEWER token rather than ADMIN to prove that.
+    private String viewerAuthHeader() {
+        return "Bearer " + jwtService.generateToken("test-viewer", Role.VIEWER).token();
+    }
+
+    private String adminAuthHeader() {
+        return "Bearer " + jwtService.generateToken("test-admin", Role.ADMIN).token();
     }
 
     private void postJournalEntry(String idempotencyKey, UUID debitAccountId, UUID creditAccountId, String amount)
@@ -58,6 +74,7 @@ class AccountControllerIntegrationTest {
                 "creditEntries", List.of(Map.of("accountId", creditAccountId, "amount", amount, "currency", "USD")));
 
         mockMvc.perform(post("/api/v1/journal-entries")
+                        .header(HttpHeaders.AUTHORIZATION, adminAuthHeader())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(body)))
                 .andExpect(status().isCreated());
@@ -71,7 +88,8 @@ class AccountControllerIntegrationTest {
         postJournalEntry("idem-" + UUID.randomUUID(), cash.getId(), revenue.getId(), "300.00");
         postJournalEntry("idem-" + UUID.randomUUID(), revenue.getId(), cash.getId(), "50.00");
 
-        mockMvc.perform(get("/api/v1/accounts/{id}/balance", cash.getId()))
+        mockMvc.perform(get("/api/v1/accounts/{id}/balance", cash.getId())
+                        .header(HttpHeaders.AUTHORIZATION, viewerAuthHeader()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.accountId").value(cash.getId().toString()))
                 .andExpect(jsonPath("$.currency").value("USD"))
@@ -80,7 +98,8 @@ class AccountControllerIntegrationTest {
 
     @Test
     void getBalance_unknownAccount_returns404() throws Exception {
-        mockMvc.perform(get("/api/v1/accounts/{id}/balance", UUID.randomUUID()))
+        mockMvc.perform(get("/api/v1/accounts/{id}/balance", UUID.randomUUID())
+                        .header(HttpHeaders.AUTHORIZATION, viewerAuthHeader()))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.status").value(404))
                 .andExpect(jsonPath("$.error").value("Not Found"));
@@ -96,6 +115,7 @@ class AccountControllerIntegrationTest {
         postJournalEntry("idem-" + UUID.randomUUID(), cash.getId(), revenue.getId(), "30.00");
 
         mockMvc.perform(get("/api/v1/accounts/{id}/ledger", cash.getId())
+                        .header(HttpHeaders.AUTHORIZATION, viewerAuthHeader())
                         .param("page", "0")
                         .param("size", "2"))
                 .andExpect(status().isOk())
@@ -120,6 +140,7 @@ class AccountControllerIntegrationTest {
         postJournalEntry("idem-" + UUID.randomUUID(), cash.getId(), revenue.getId(), "20.00");
 
         mockMvc.perform(get("/api/v1/accounts/{id}/ledger", cash.getId())
+                        .header(HttpHeaders.AUTHORIZATION, viewerAuthHeader())
                         .param("sort", "amount,asc"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content[0].amount").value(10.00))
@@ -129,7 +150,8 @@ class AccountControllerIntegrationTest {
 
     @Test
     void getLedger_unknownAccount_returns404() throws Exception {
-        mockMvc.perform(get("/api/v1/accounts/{id}/ledger", UUID.randomUUID()))
+        mockMvc.perform(get("/api/v1/accounts/{id}/ledger", UUID.randomUUID())
+                        .header(HttpHeaders.AUTHORIZATION, viewerAuthHeader()))
                 .andExpect(status().isNotFound());
     }
 }
