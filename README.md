@@ -6,8 +6,7 @@
 ![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-A backend double entry ledger modeled after the bookkeeping infrastructure used by banks and payment processors, built to explore the correctness challenges behind financial systems.
-
+A backend double entry ledger modeled after the bookkeeping infrastructure used by banks and payment processors.
 <!-- Screenshot placeholder: add a screenshot of Swagger UI here, e.g. docs/images/swagger.png -->
 
 <!-- ![Swagger UI](docs/images/swagger.png) -->
