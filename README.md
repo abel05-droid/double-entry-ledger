@@ -15,7 +15,7 @@ Every transaction is recorded as a balanced pair of debit and credit entries. Ba
 
 The system is tested under concurrent load, publishes Kafka events only after successful database commits, and includes JWT authentication, structured logging, and observability.
 
-**Try it live:** once running locally, Swagger UI is at http://localhost:8080/swagger-ui.html. See [Running Locally](#running-locally) below for demo credentials.
+Once running locally, Swagger UI is available at `http://localhost:8080/swagger-ui.html`. See [Running Locally](#running-locally) below for setup instructions and demo credentials.
 
 ## Why I built it this way
 
